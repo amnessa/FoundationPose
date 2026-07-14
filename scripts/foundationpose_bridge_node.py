@@ -142,10 +142,14 @@ class FoundationPoseBridgeNode(Node):
         self._transfer_dir = resolve_transfer_dir()
         self._camera_path = self._transfer_dir / 'camera.json'
 
-        # The server returns the mask it registered against and an overlay of the
-        # pose on the frame; both land here, overwritten each trigger. When a pose
-        # looks wrong these two images tell you whether the mask or the estimator
-        # was at fault.
+        # The server's artifacts land here, overwritten each trigger:
+        #   detection_pem.json  init pose, SAM-6D format (t in mm)   -> ICP node
+        #   detection_ism.npz   segmentation (1,H,W) from SAM2       -> ICP node
+        #   mask.png / vis_pose.png   the same result to look at
+        # The ICP node reads the first two off disk rather than from the ROS
+        # message, so point its `results_dir` parameter at THIS directory. If you
+        # leave it on the old sam6d_results default it will happily refine against
+        # a stale mask from a previous SAM-6D run.
         results_dir = str(self.get_parameter('results_dir').value)
         self._results_dir = (Path(results_dir) if results_dir
                              else self._transfer_dir.parent / 'foundationpose_results')

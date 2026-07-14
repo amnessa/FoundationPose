@@ -22,6 +22,12 @@ FoundationPose actually is:
   .ply files are mm), so the translation comes back in metres. The client must
   not divide by 1000 anymore.
 
+The SAM-6D artifacts the downstream ICP node reads off disk -- `detection_pem.json`
+(init pose) and `detection_ism.npz` (the segmentation mask that crops the scene
+cloud) -- are still produced, in SAM-6D's exact format, and still base64'd back to
+the client. See `sam6d_style_artifacts()`. That node therefore needs no changes
+beyond pointing its `results_dir` at where the new bridge saves them.
+
 Configuration (all optional, via env vars):
 
     MESH_PATH        CAD model of the object          (Data/Input/test_objv2_base.ply)
@@ -37,6 +43,7 @@ Configuration (all optional, via env vars):
     PORT             (5000)
 """
 
+import io
 import os
 import sys
 import json
@@ -307,11 +314,36 @@ def render_overlay(rgb, pose, K):
     return cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
 
 
-def png_b64(image):
-    ok, buf = cv2.imencode('.png', image)
-    if not ok:
-        raise RuntimeError("failed to PNG-encode an output image")
-    return base64.b64encode(buf.tobytes()).decode('ascii')
+def sam6d_style_artifacts(mask, pose, score):
+    """Re-emit the result in SAM-6D's on-disk format.
+
+    The downstream ICP node does not take the mask off the ROS message -- its
+    `_load_detection()` reads `detection_pem.json` for the init pose and
+    `detection_ism.npz['segmentation']` (K,H,W) for the mask that crops the
+    scene cloud. Writing those two files keeps that node working untouched.
+
+    Note the translation here is in MILLIMETRES, because that is the SAM-6D
+    convention the ICP node already divides out. The HTTP `pose` field remains
+    metres -- these files are a compatibility shim, not the primary contract.
+    """
+    ys, xs = np.nonzero(mask)
+    bbox = [int(xs.min()), int(ys.min()),
+            int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)]
+    pem = [{
+        "scene_id": 0,
+        "image_id": 0,
+        "category_id": 1,
+        "bbox": bbox,
+        "score": score,
+        "time": 0.0,
+        "R": pose[:3, :3].tolist(),
+        "t": (pose[:3, 3] * 1000.0).tolist(),
+    }]
+    # (K,H,W) with K=1: FoundationPose registers the one object you clicked, so
+    # the ICP node's argmax-over-detections picks index 0.
+    buf = io.BytesIO()
+    np.savez_compressed(buf, segmentation=mask[None].astype(bool))
+    return json.dumps(pem).encode('utf-8'), buf.getvalue()
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -384,12 +416,22 @@ def predict_pose():
         score = float(EST.scores[0]) if getattr(EST, 'scores', None) is not None else 0.0
         vis = render_overlay(rgb, pose, K)
         mask_png = (mask.astype(np.uint8) * 255)
+        pem_bytes, ism_bytes = sam6d_style_artifacts(mask, pose, score)
 
-        cv2.imwrite(os.path.join(OUTPUT_DIR, "vis_pose.png"), vis)
-        cv2.imwrite(os.path.join(OUTPUT_DIR, "mask.png"), mask_png)
-        np.savetxt(os.path.join(OUTPUT_DIR, "ob_in_cam.txt"), pose.reshape(4, 4))
-        for name in ("vis_pose.png", "mask.png", "ob_in_cam.txt"):
-            _give_back_ownership(os.path.join(OUTPUT_DIR, name))
+        # Everything the client needs to reconstruct the result byte-for-byte on
+        # its side. detection_pem.json / detection_ism.npz are what the ICP node
+        # actually consumes; mask.png / vis_pose.png are for looking at.
+        artifacts = {
+            "detection_pem.json": pem_bytes,
+            "detection_ism.npz": ism_bytes,
+            "mask.png": cv2.imencode('.png', mask_png)[1].tobytes(),
+            "vis_pose.png": cv2.imencode('.png', vis)[1].tobytes(),
+        }
+        for name, payload in artifacts.items():
+            path = os.path.join(OUTPUT_DIR, name)
+            with open(path, 'wb') as fh:
+                fh.write(payload)
+            _give_back_ownership(path)
 
         logging.info(f"registered in {elapsed:.2f}s  score={score:.3f}  "
                      f"t={pose[:3, 3].round(4)}m")
@@ -401,7 +443,8 @@ def predict_pose():
             "score": score,
             "mask_score": mask_score,
             "mask_source": mask_source,
-            "artifacts": {"mask.png": png_b64(mask_png), "vis_pose.png": png_b64(vis)},
+            "artifacts": {name: base64.b64encode(payload).decode('ascii')
+                          for name, payload in artifacts.items()},
         })
     except Exception as exc:  # noqa: BLE001 - report anything back to the client
         logging.exception("registration failed")
