@@ -75,7 +75,7 @@ app = Flask(__name__)
 DATA_DIR = os.path.join(CODE_DIR, "Data", "Input")
 OUTPUT_DIR = os.path.join(CODE_DIR, "Data", "Output", "foundationpose_results")
 
-MESH_PATH = os.environ.get("MESH_PATH", os.path.join(DATA_DIR, "test_objv2_base.ply"))
+MESH_PATH = os.environ.get("MESH_PATH", os.path.join(DATA_DIR, "test_objv2_ear.ply"))
 MESH_SCALE = float(os.environ.get("MESH_SCALE", "0.001"))
 SYMMETRY_INFO = os.environ.get("SYMMETRY_INFO", "")
 EST_REFINE_ITER = int(os.environ.get("EST_REFINE_ITER", "5"))
