@@ -12,10 +12,19 @@ FoundationPose actually is:
   request we open the received frame in a window, you click the object, SAM2
   turns the click into a mask, and that mask seeds `est.register()`. Send a
   `mask` file or a `click` field instead to skip the window entirely.
+- **It does not know which CAD it is looking at, so it works that out first.**
+  A PPF classifier (`ppf_classifier.py`) holds a library built from every .ply in
+  `CAD_DIR`. Once SAM2 has produced the mask, the masked depth becomes a small
+  oriented point cloud, that cloud is matched against every model in the library,
+  and the winner *names* the CAD that registration then runs against. The
+  classifier returns a name and nothing else -- pose estimation is FoundationPose's
+  job, and it starts from scratch on the CAD it is given. Set `PPF_ENABLE=0` to
+  skip all of this and pin the server to `MESH_PATH`, which is what it used to do.
 - **The model stays resident.** SAM-6D re-ran `demo.sh` (template rendering ->
-  segmentation -> pose) as a subprocess on every request. Here the mesh, the
-  refiner/scorer networks and SAM2 are loaded once at startup, so a request is
-  a registration and nothing else.
+  segmentation -> pose) as a subprocess on every request. Here the refiner/scorer
+  networks and SAM2 are loaded once at startup, and the CAD is swapped in per
+  request via `reset_object()` -- the expensive part is the networks, not the mesh,
+  so classification does not cost a reload.
 - **One object, one pose.** SAM-6D returned a ranked list of detections; this
   returns the single pose of the thing you clicked, as a 4x4 matrix.
 - **Metres, not millimetres.** The CAD is scaled to metres on load (BOP-style
@@ -28,10 +37,30 @@ cloud) -- are still produced, in SAM-6D's exact format, and still base64'd back 
 the client. See `sam6d_style_artifacts()`. That node therefore needs no changes
 beyond pointing its `results_dir` at where the new bridge saves them.
 
+Endpoints:
+
+    POST /predict_pose   the whole pipeline: mask -> classify -> register -> pose
+    POST /classify       classification only, no registration. Same payload as
+                         /predict_pose. This is the endpoint to use during bring-up:
+                         it returns the full score table in about a second without
+                         spending GPU time on a pose you are only going to look at.
+    POST /add_model      upload a .ply, index it into the live library, persist it
+    GET  /health         what is loaded, what is in the library
+
 Configuration (all optional, via env vars):
 
-    MESH_PATH        CAD model of the object          (Data/Input/test_objv2_base.ply)
+    MESH_PATH        fallback CAD, used when PPF is off or classification fails
+                                                      (Data/Input/test_objv2_ear.ply)
     MESH_SCALE       multiplied into the mesh on load (0.001 -- i.e. mm -> m)
+    PPF_ENABLE       1 to classify, 0 to always use MESH_PATH        (1)
+    CAD_DIR          directory scanned for library .ply files (Data/Input)
+    PPF_LIBRARY      the library .npz                    (Data/ppf_library.npz)
+    PPF_MIN_MARGIN   top-to-runner-up score gap below which the result is flagged
+                     ambiguous. 0 means "always accept the winner". Two thin plates
+                     of similar size are genuinely indistinguishable from one view;
+                     raise this once you have watched real margins, and set
+                     PPF_STRICT=1 to refuse rather than guess.        (0.0)
+    PPF_TAU          verification inlier radius in metres, i.e. your depth noise (0.008)
     SYMMETRY_INFO    BOP models_info-style .json with `symmetries_discrete` /
                      `symmetries_continuous` for the object. Strongly recommended
                      for symmetric parts (plates, blocks): without it, registration
@@ -70,6 +99,15 @@ from estimater import (  # noqa: E402
 )
 from Utils import draw_posed_3d_box, draw_xyz_axis, symmetry_tfs_from_info  # noqa: E402
 
+sys.path.insert(0, os.path.join(CODE_DIR, "scripts"))
+from ppf_classifier import (  # noqa: E402
+    PPFLibrary,
+    PPFParams,
+    QueryParams,
+    find_ply_files,
+    scene_cloud_from_mask,
+)
+
 app = Flask(__name__)
 
 DATA_DIR = os.path.join(CODE_DIR, "Data", "Input")
@@ -80,6 +118,13 @@ MESH_SCALE = float(os.environ.get("MESH_SCALE", "0.001"))
 SYMMETRY_INFO = os.environ.get("SYMMETRY_INFO", "")
 EST_REFINE_ITER = int(os.environ.get("EST_REFINE_ITER", "5"))
 ZFAR = float(os.environ.get("ZFAR", "3.0"))
+
+PPF_ENABLE = os.environ.get("PPF_ENABLE", "1") not in ("0", "false", "False")
+CAD_DIR = os.environ.get("CAD_DIR", DATA_DIR)
+PPF_LIBRARY = os.environ.get("PPF_LIBRARY", os.path.join(CODE_DIR, "Data", "ppf_library.npz"))
+PPF_MIN_MARGIN = float(os.environ.get("PPF_MIN_MARGIN", "0.0"))
+PPF_STRICT = os.environ.get("PPF_STRICT", "0") not in ("0", "false", "False")
+PPF_TAU = float(os.environ.get("PPF_TAU", "0.008"))
 
 SAM2_CKPT = os.environ.get(
     "SAM2_CKPT", os.path.join(CODE_DIR, "weights", "sam2", "sam2.1_hiera_small.pt"))
@@ -113,10 +158,22 @@ def _give_back_ownership(path):
 
 # ── Model loading (once, at startup) ──────────────────────────────────────
 
-def load_estimator():
-    mesh = trimesh.load(MESH_PATH, force='mesh')
+_mesh_cache = {}
+
+
+def load_cad(path):
+    """A CAD mesh in metres, plus the oriented-bounds box the overlay is drawn from.
+
+    Cached because the classifier may pick the same part on request after request,
+    and `trimesh.bounds.oriented_bounds` is not free on a 250k-vertex scan.
+    """
+    if path in _mesh_cache:
+        return _mesh_cache[path]
+    mesh = trimesh.load(path, force='mesh')
     if MESH_SCALE != 1.0:
         mesh.apply_scale(MESH_SCALE)
+    to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
+    bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
     # FoundationPose renders the mesh to compare against the RGB crop. An
     # untextured CAD model is fine -- make_mesh_tensors() falls back to flat gray
@@ -128,7 +185,21 @@ def load_estimator():
         tex = "vertex colours"
     else:
         tex = "none (flat gray)"
+    logging.info(f"loaded CAD {os.path.basename(path)}: extents={mesh.extents.round(4)}m "
+                 f"texture={tex}")
+    _mesh_cache[path] = (mesh, to_origin, bbox)
+    return _mesh_cache[path]
 
+
+def load_estimator():
+    """One FoundationPose, holding whichever CAD was used last.
+
+    The scorer and refiner networks are the expensive part of construction and they
+    are object-agnostic, so swapping CAD between requests is `reset_object()` on
+    this one instance rather than a second FoundationPose. That is what makes it
+    affordable to let the classifier choose the mesh per request.
+    """
+    mesh, _, _ = load_cad(MESH_PATH)
     symmetry_tfs = None
     if SYMMETRY_INFO:
         with open(SYMMETRY_INFO) as fh:
@@ -145,10 +216,112 @@ def load_estimator():
         debug=0,
         debug_dir=os.path.join(CODE_DIR, "debug"),
     )
-    logging.info(
-        f"mesh={MESH_PATH} scale={MESH_SCALE} extents={mesh.extents.round(4)}m "
-        f"texture={tex} symmetry_tfs={0 if symmetry_tfs is None else len(symmetry_tfs)}")
-    return est, mesh
+    est._loaded_cad = MESH_PATH
+    logging.info(f"fallback mesh={MESH_PATH} scale={MESH_SCALE} "
+                 f"symmetry_tfs={0 if symmetry_tfs is None else len(symmetry_tfs)}")
+    return est
+
+
+def use_cad(path):
+    """Point the estimator at a CAD file. Returns (mesh, to_origin, bbox)."""
+    mesh, to_origin, bbox = load_cad(path)
+    if getattr(EST, '_loaded_cad', None) != path:
+        started = time.monotonic()
+        EST.reset_object(model_pts=mesh.vertices, model_normals=mesh.vertex_normals,
+                         mesh=mesh)
+        EST._loaded_cad = path
+        logging.info(f"switched CAD -> {os.path.basename(path)} "
+                     f"({time.monotonic()-started:.2f}s)")
+    return mesh, to_origin, bbox
+
+
+def load_ppf_library():
+    """The CAD library, rebuilt from CAD_DIR if the .npz is missing or stale.
+
+    Auto-building on a missing .npz is deliberate: the alternative is a server that
+    starts fine and then fails on the first live trigger because nobody ran the
+    offline step. Note that a rebuild only re-derives the sampled clouds -- OpenCV
+    cannot serialize a trained PPF3DDetector, so the hashtables are built in-process
+    either way, at roughly a second or two per model.
+    """
+    if not PPF_ENABLE:
+        logging.info("PPF_ENABLE=0: classification off, every request uses MESH_PATH")
+        return None
+    try:
+        if os.path.exists(PPF_LIBRARY):
+            return PPFLibrary.load(PPF_LIBRARY, train=True)
+        paths = find_ply_files(CAD_DIR)
+        if not paths:
+            logging.warning(f"no .ply files in CAD_DIR={CAD_DIR}; classification off")
+            return None
+        logging.info(f"no library at {PPF_LIBRARY}; building it from {len(paths)} "
+                     f"CAD file(s) in {CAD_DIR}")
+        lib = PPFLibrary.build(paths, PPFParams(mesh_scale=MESH_SCALE))
+        if not lib.models:
+            return None
+        lib.save(PPF_LIBRARY)
+        _give_back_ownership(PPF_LIBRARY)
+        lib.train()
+        return lib
+    except Exception as exc:  # noqa: BLE001 - a broken library must not stop the server
+        logging.exception(f"could not load the PPF library ({exc}); classification off")
+        return None
+
+
+def cad_path_for(name):
+    """Library model name -> the .ply on disk that FoundationPose should register."""
+    rec = LIBRARY.get(name) if LIBRARY else None
+    if rec is None:
+        return None
+    path = os.path.join(CAD_DIR, rec.filename)
+    return path if os.path.exists(path) else None
+
+
+def classify_object(depth, K, mask):
+    """Mask + depth -> the name of the CAD to register against.
+
+    Returns (cad_path, report). `report` is the full score table and always goes
+    back to the client, winner or not -- the runner-up margin is the number worth
+    watching during bring-up, and it costs nothing to carry.
+
+    A pose *is* computed inside the classifier, for each candidate, as the only way
+    to ask "does this CAD explain this cloud". It is used to compute the score and
+    then dropped on the floor. Nothing downstream of here sees it; FoundationPose
+    below re-estimates the pose from scratch.
+    """
+    if LIBRARY is None:
+        return None, {'ok': False, 'message': 'classification is off'}
+
+    started = time.monotonic()
+    pts, nrm = scene_cloud_from_mask(depth, K, mask)
+    if len(pts) < 20:
+        return None, {'ok': False, 'scores': {},
+                      'message': f'only {len(pts)} points survived masking the depth'}
+
+    report = LIBRARY.classify(pts, nrm, K=K, q=QueryParams(
+        tau_m=PPF_TAU, min_margin=PPF_MIN_MARGIN))
+    report['elapsed_sec'] = round(time.monotonic() - started, 2)
+
+    if not report.get('ok'):
+        return None, report
+    path = cad_path_for(report['object_name'])
+    if path is None:
+        report['ok'] = False
+        report['message'] = (f"classified as '{report['object_name']}' but "
+                             f"{report.get('object_file')} is not in CAD_DIR={CAD_DIR}")
+        return None, report
+
+    top = report['scores']
+    logging.info(f"PPF: {report['object_name']} score={report['score']:.3f} "
+                 f"margin={report['margin']:.3f} over {report.get('runner_up')} "
+                 f"({report['scene_points']} pts, {report['elapsed_sec']:.1f}s) "
+                 f"table={dict(list(top.items())[:4])}")
+    if report.get('ambiguous'):
+        logging.warning(
+            f"PPF margin {report['margin']:.3f} is below PPF_MIN_MARGIN="
+            f"{PPF_MIN_MARGIN}: '{report['object_name']}' and "
+            f"'{report.get('runner_up')}' are not separable from this view")
+    return path, report
 
 
 def load_sam2():
@@ -303,18 +476,20 @@ def resolve_mask(predictor, rgb):
 
 # ── Result rendering ──────────────────────────────────────────────────────
 
-def render_overlay(rgb, pose, K):
+def render_overlay(rgb, pose, K, to_origin, bbox):
     """The pose drawn on the frame: oriented box + axes. This is the artifact to
     look at first when a pose comes back wrong -- it usually shows the mask
-    grabbed the wrong thing, or the object is symmetric and flipped."""
-    center_pose = pose @ np.linalg.inv(TO_ORIGIN)
-    vis = draw_posed_3d_box(K, img=rgb, ob_in_cam=center_pose, bbox=BBOX)
+    grabbed the wrong thing, the object is symmetric and flipped, or (new failure
+    mode) the classifier named the wrong CAD, in which case the box is the right
+    shape for a part that is not there."""
+    center_pose = pose @ np.linalg.inv(to_origin)
+    vis = draw_posed_3d_box(K, img=rgb, ob_in_cam=center_pose, bbox=bbox)
     vis = draw_xyz_axis(vis, ob_in_cam=center_pose, scale=0.1, K=K,
                         thickness=3, transparency=0, is_input_rgb=True)
     return cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
 
 
-def sam6d_style_artifacts(mask, pose, score):
+def sam6d_style_artifacts(mask, pose, score, object_name=None):
     """Re-emit the result in SAM-6D's on-disk format.
 
     The downstream ICP node does not take the mask off the ROS message -- its
@@ -325,6 +500,11 @@ def sam6d_style_artifacts(mask, pose, score):
     Note the translation here is in MILLIMETRES, because that is the SAM-6D
     convention the ICP node already divides out. The HTTP `pose` field remains
     metres -- these files are a compatibility shim, not the primary contract.
+
+    `obj_name` is an extra key SAM-6D never wrote. It carries the classifier's
+    answer to any consumer that reads these files off disk instead of the ROS
+    message, so a tracking node can load the right .ply without being rewritten to
+    speak HTTP. Readers that do not know the key ignore it.
     """
     ys, xs = np.nonzero(mask)
     bbox = [int(xs.min()), int(ys.min()),
@@ -338,6 +518,7 @@ def sam6d_style_artifacts(mask, pose, score):
         "time": 0.0,
         "R": pose[:3, :3].tolist(),
         "t": (pose[:3, 3] * 1000.0).tolist(),
+        "obj_name": object_name,
     }]
     # (K,H,W) with K=1: FoundationPose registers the one object you clicked, so
     # the ICP node's argmax-over-detections picks index 0.
@@ -352,12 +533,157 @@ def sam6d_style_artifacts(mask, pose, score):
 def health():
     return jsonify({
         "status": "ok",
-        "mesh_path": MESH_PATH,
+        "fallback_mesh_path": MESH_PATH,
         "mesh_scale": MESH_SCALE,
         "est_refine_iter": EST_REFINE_ITER,
         "interactive": bool(os.environ.get('DISPLAY')),
         "busy": _lock.locked(),
+        "ppf": {
+            "enabled": LIBRARY is not None,
+            "library": PPF_LIBRARY if LIBRARY is not None else None,
+            "cad_dir": CAD_DIR,
+            "models": LIBRARY.names if LIBRARY is not None else [],
+            "min_margin": PPF_MIN_MARGIN,
+            "strict": PPF_STRICT,
+            "tau_m": PPF_TAU,
+        },
     })
+
+
+def _receive_frame():
+    """Save the three uploaded files and decode them. Shared by both endpoints.
+
+    Returns (K, rgb, depth) or raises ValueError with a client-facing message.
+    """
+    for field in ('rgb', 'depth', 'camera'):
+        if field not in request.files:
+            raise ValueError(f"missing required file field: '{field}'")
+
+    rgb_path = os.path.join(DATA_DIR, "rgb.png")
+    depth_path = os.path.join(DATA_DIR, "depth.png")
+    camera_path = os.path.join(DATA_DIR, "camera.json")
+    request.files['rgb'].save(rgb_path)
+    request.files['depth'].save(depth_path)
+    request.files['camera'].save(camera_path)
+    for path in (DATA_DIR, rgb_path, depth_path, camera_path):
+        _give_back_ownership(path)
+
+    K, depth_scale = read_camera(camera_path)
+    rgb = read_rgb(rgb_path)
+    depth = read_depth(depth_path, depth_scale)
+    if rgb.shape[:2] != depth.shape[:2]:
+        raise ValueError(f"rgb {rgb.shape[:2]} and depth {depth.shape[:2]} differ in "
+                         "size; the depth must be registered to the colour frame")
+    return K, rgb, depth
+
+
+@app.route('/classify', methods=['POST'])
+def classify():
+    """Classification only -- mask, then PPF, then stop. No registration.
+
+    Same payload as /predict_pose. This is the endpoint for bring-up: it answers in
+    about a second and hands back the entire score table, so you can watch how the
+    margin behaves across viewpoints and lighting without spending GPU time on a
+    pose you were only ever going to glance at.
+    """
+    if not _lock.acquire(blocking=False):
+        return jsonify({"status": "error", "message": "busy with another request"}), 503
+    try:
+        K, rgb, depth = _receive_frame()
+        mask, mask_score, mask_source = resolve_mask(SAM2, rgb)
+        if not mask.any():
+            return jsonify({"status": "error", "message": "the mask is empty"}), 400
+
+        cad_path, report = classify_object(depth, K, mask)
+        return jsonify({
+            "status": "success" if report.get('ok') else "error",
+            "object_name": report.get('object_name'),
+            "object_file": report.get('object_file'),
+            "cad_path": cad_path,
+            "mask_score": mask_score,
+            "mask_source": mask_source,
+            "classification": report,
+        }), (200 if report.get('ok') else 422)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("classification failed")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+    finally:
+        _lock.release()
+
+
+@app.route('/add_model', methods=['POST'])
+def add_model():
+    """Take a new .ply into the live library, and persist it.
+
+        curl -F model=@new_part.ply http://host:5000/add_model
+
+    The motivating case is a part assembled from two existing models and exported as
+    a new mesh: it has to become classifiable without restarting a server that took a
+    minute to load its networks. Adding is genuinely incremental -- each model owns
+    its own OpenCV detector, so nothing else in the library is retrained.
+
+    Optional form fields:
+        name            override the model name (default: the .ply's stem)
+        sampling_step   per-model PPF sampling step. Thin curved parts need a finer
+                        step (~0.025) than machined blocks; ppf_selftest.py tells you
+                        which ones, by scoring each model against itself.
+    """
+    if LIBRARY is None:
+        return jsonify({"status": "error",
+                        "message": "classification is off, so there is no library to add to"}), 409
+    if not _lock.acquire(blocking=False):
+        return jsonify({"status": "error", "message": "busy with another request"}), 503
+    try:
+        if 'model' not in request.files:
+            return jsonify({"status": "error",
+                            "message": "missing required file field: 'model'"}), 400
+        upload = request.files['model']
+        name = request.form.get('name') or os.path.splitext(
+            os.path.basename(upload.filename or 'model.ply'))[0]
+        if not name or os.path.sep in name or name.startswith('.'):
+            return jsonify({"status": "error", "message": f"unusable model name {name!r}"}), 400
+        step = request.form.get('sampling_step')
+
+        os.makedirs(CAD_DIR, exist_ok=True)
+        path = os.path.join(CAD_DIR, f"{name}.ply")
+        upload.save(path)
+        _give_back_ownership(path)
+
+        rec = LIBRARY.add_model(path, sampling_step=float(step) if step else None)
+        LIBRARY.save(PPF_LIBRARY)
+        _give_back_ownership(PPF_LIBRARY)
+        # A new CAD invalidates nothing about the meshes already loaded, but if this
+        # replaced a model of the same name the cached trimesh is now stale.
+        _mesh_cache.pop(path, None)
+
+        logging.info(f"added CAD '{rec.name}' to the library ({len(LIBRARY.models)} total)")
+        return jsonify({
+            "status": "success",
+            "object_name": rec.name,
+            "object_file": rec.filename,
+            "cad_path": path,
+            "diameter_m": round(rec.diameter, 5),
+            "extents_m": np.asarray(rec.extents).round(5).tolist(),
+            "model_points": int(len(rec.cloud)),
+            "models": LIBRARY.names,
+            # A newly exported part is exactly where a wrong FreeCAD export unit
+            # shows up, and the extent pre-filter compares physical size, so a
+            # mis-scaled model would be quietly unclassifiable. Say it here.
+            "scale_warning": rec.scale_warning,
+            # Two parts of near-identical size cannot be told apart by the extent
+            # pre-filter, so the new model's arrival may have made an existing one
+            # ambiguous. Say so now rather than at the first confused trigger.
+            "similar_diameter": [m.name for m in LIBRARY.models
+                                 if m.name != rec.name and rec.diameter > 0
+                                 and abs(m.diameter - rec.diameter) / rec.diameter < 0.10],
+        })
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("could not add the model")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+    finally:
+        _lock.release()
 
 
 @app.route('/predict_pose', methods=['POST'])
@@ -367,31 +693,9 @@ def predict_pose():
                         "message": "busy with another request"}), 503
     try:
         try:
-            rgb_file = request.files['rgb']
-            depth_file = request.files['depth']
-            camera_file = request.files['camera']
-        except KeyError as missing:
-            return jsonify({"status": "error",
-                            "message": f"missing required file field: {missing}"}), 400
-
-        rgb_path = os.path.join(DATA_DIR, "rgb.png")
-        depth_path = os.path.join(DATA_DIR, "depth.png")
-        camera_path = os.path.join(DATA_DIR, "camera.json")
-        rgb_file.save(rgb_path)
-        depth_file.save(depth_path)
-        camera_file.save(camera_path)
-        for path in (DATA_DIR, rgb_path, depth_path, camera_path):
-            _give_back_ownership(path)
-
-        K, depth_scale = read_camera(camera_path)
-        rgb = read_rgb(rgb_path)
-        depth = read_depth(depth_path, depth_scale)
-        if rgb.shape[:2] != depth.shape[:2]:
-            return jsonify({
-                "status": "error",
-                "message": f"rgb {rgb.shape[:2]} and depth {depth.shape[:2]} differ in size; "
-                           "the depth must be registered to the colour frame",
-            }), 400
+            K, rgb, depth = _receive_frame()
+        except ValueError as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 400
 
         mask, mask_score, mask_source = resolve_mask(SAM2, rgb)
         if not mask.any():
@@ -403,7 +707,38 @@ def predict_pose():
                            f"depth range, or beyond ZFAR={ZFAR}m",
             }), 400
 
-        logging.info(f"registering: mask from {mask_source}, {int(mask.sum())} px")
+        # --- which CAD? ---------------------------------------------------
+        # PPF names the part; that name selects the mesh; FoundationPose then
+        # estimates the pose from that mesh, from scratch. The classifier's own
+        # internal pose hypotheses do not survive this line.
+        cad_path, report = classify_object(depth, K, mask)
+        if cad_path is None:
+            if PPF_STRICT and LIBRARY is not None:
+                return jsonify({
+                    "status": "error",
+                    "message": f"PPF could not name the object: "
+                               f"{report.get('message', 'no model scored above zero')}",
+                    "classification": report,
+                }), 422
+            if LIBRARY is not None:
+                logging.warning(f"PPF gave no usable answer "
+                                f"({report.get('message', 'no model scored')}); "
+                                f"falling back to MESH_PATH={os.path.basename(MESH_PATH)}")
+            cad_path = MESH_PATH
+        elif report.get('ambiguous') and PPF_STRICT:
+            return jsonify({
+                "status": "error",
+                "message": f"PPF margin {report['margin']:.3f} < PPF_MIN_MARGIN "
+                           f"{PPF_MIN_MARGIN}: cannot separate "
+                           f"'{report['object_name']}' from '{report.get('runner_up')}'",
+                "classification": report,
+            }), 422
+
+        mesh, to_origin, bbox = use_cad(cad_path)
+        object_name = os.path.splitext(os.path.basename(cad_path))[0]
+
+        logging.info(f"registering {object_name}: mask from {mask_source}, "
+                     f"{int(mask.sum())} px")
         started = time.monotonic()
         pose = EST.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
                             iteration=EST_REFINE_ITER)
@@ -414,9 +749,9 @@ def predict_pose():
         # against each other -- it is NOT a probability like SAM-6D's score, so
         # don't carry a SAM-6D `min_score` threshold over unchanged.
         score = float(EST.scores[0]) if getattr(EST, 'scores', None) is not None else 0.0
-        vis = render_overlay(rgb, pose, K)
+        vis = render_overlay(rgb, pose, K, to_origin, bbox)
         mask_png = (mask.astype(np.uint8) * 255)
-        pem_bytes, ism_bytes = sam6d_style_artifacts(mask, pose, score)
+        pem_bytes, ism_bytes = sam6d_style_artifacts(mask, pose, score, object_name)
 
         # Everything the client needs to reconstruct the result byte-for-byte on
         # its side. detection_pem.json / detection_ism.npz are what the ICP node
@@ -426,6 +761,9 @@ def predict_pose():
             "detection_ism.npz": ism_bytes,
             "mask.png": cv2.imencode('.png', mask_png)[1].tobytes(),
             "vis_pose.png": cv2.imencode('.png', vis)[1].tobytes(),
+            # The classifier's answer as a plain file, for anything downstream that
+            # watches the results directory rather than parsing the reply.
+            "object_name.txt": object_name.encode('utf-8'),
         }
         for name, payload in artifacts.items():
             path = os.path.join(OUTPUT_DIR, name)
@@ -433,7 +771,7 @@ def predict_pose():
                 fh.write(payload)
             _give_back_ownership(path)
 
-        logging.info(f"registered in {elapsed:.2f}s  score={score:.3f}  "
+        logging.info(f"registered {object_name} in {elapsed:.2f}s  score={score:.3f}  "
                      f"t={pose[:3, 3].round(4)}m")
         return jsonify({
             "status": "success",
@@ -441,6 +779,11 @@ def predict_pose():
             "units": "m",
             "pose": pose.reshape(4, 4).tolist(),
             "score": score,
+            # What PPF decided, and how confidently. The bridge republishes
+            # object_name so the tracking client knows which .ply to load.
+            "object_name": object_name,
+            "object_file": os.path.basename(cad_path),
+            "classification": report,
             "mask_score": mask_score,
             "mask_source": mask_source,
             "artifacts": {name: base64.b64encode(payload).decode('ascii')
@@ -456,9 +799,8 @@ def predict_pose():
 set_logging_format()
 set_seed(0)
 
-EST, MESH = load_estimator()
-TO_ORIGIN, EXTENTS = trimesh.bounds.oriented_bounds(MESH)
-BBOX = np.stack([-EXTENTS / 2, EXTENTS / 2], axis=0).reshape(2, 3)
+EST = load_estimator()
+LIBRARY = load_ppf_library()
 SAM2 = load_sam2()
 
 
