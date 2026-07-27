@@ -12,6 +12,18 @@ FoundationPose actually is:
   request we open the received frame in a window, you click the object, SAM2
   turns the click into a mask, and that mask seeds `est.register()`. Send a
   `mask` file or a `click` field instead to skip the window entirely.
+
+  The `click` field is how the gesture client drives this headlessly:
+
+      click         {"u": 640, "v": 360}  or  [[640,360], [710,300], ...]
+      click_labels  optional parallel list, 1 = object, 0 = not-object
+                    (absent = all positive). At least one 1 is required --
+                    negatives only carve, they cannot start a mask.
+
+  Points are validated against the frame they arrived with, so a client that
+  latched a pixel on a differently-sized image is rejected rather than quietly
+  segmenting the wrong thing. With `click` set the server never needs DISPLAY,
+  so the container can run without X11 forwarding.
 - **It does not know which CAD it is looking at, so it works that out first.**
   A PPF classifier (`ppf_classifier.py`) holds a library built from every .ply in
   `CAD_DIR`. Once SAM2 has produced the mask, the masked depth becomes a small
@@ -444,8 +456,51 @@ def click_for_mask(predictor, rgb):
         cv2.waitKey(1)
 
 
+def parse_click(spec_json, labels_json, shape):
+    """The client's click fields -> (points, labels), validated against the frame.
+
+    `click` is either `{"u":.., "v":..}` or `[[u,v], ...]`. `click_labels` is an
+    optional parallel list of 1 (object) / 0 (not-object); absent means all
+    positive, which is what the field meant before negatives existed.
+
+    Both checks below exist because a click is the one input to this server that
+    arrives with no image attached to sanity-check it against. A coordinate that
+    is off the frame -- a client that latched against a different resolution, or
+    sent (v,u) -- would otherwise reach SAM2, get silently clamped, and come back
+    as a plausible mask of the wrong thing. Fail loudly instead.
+    """
+    height, width = shape[:2]
+    spec = json.loads(spec_json)
+    if isinstance(spec, dict):
+        points = [[spec['u'], spec['v']]]
+    else:
+        points = [list(p) for p in spec]
+    if not points:
+        raise ValueError("the 'click' field is empty")
+
+    if labels_json:
+        labels = [int(v) for v in json.loads(labels_json)]
+        if len(labels) != len(points):
+            raise ValueError(f"got {len(points)} click point(s) but "
+                             f"{len(labels)} label(s); they must be parallel")
+    else:
+        labels = [1] * len(points)
+
+    if 1 not in labels:
+        # SAM2 has nothing to grow a mask from: negatives only carve.
+        raise ValueError("every click is negative; at least one positive point "
+                         "(label 1) is needed to produce a mask")
+
+    for (u, v) in points:
+        if not (0 <= u < width and 0 <= v < height):
+            raise ValueError(f"click ({u}, {v}) is outside the {width}x{height} "
+                             "frame -- the client latched the point against a "
+                             "different image than it sent")
+    return points, labels
+
+
 def resolve_mask(predictor, rgb):
-    """Mask, in order of preference: one uploaded by the client, a click point
+    """Mask, in order of preference: one uploaded by the client, click points
     the client sent, or the interactive window."""
     if 'mask' in request.files:
         buf = np.frombuffer(request.files['mask'].read(), np.uint8)
@@ -456,11 +511,11 @@ def resolve_mask(predictor, rgb):
 
     click = request.form.get('click')
     if click:
-        spec = json.loads(click)
-        points = spec if isinstance(spec, list) else [[spec['u'], spec['v']]]
-        labels = [1] * len(points)
+        points, labels = parse_click(click, request.form.get('click_labels'), rgb.shape)
         mask, score = sam2_mask(predictor, rgb, points, labels)
-        return mask, score, "sam2(client click)"
+        n_neg = labels.count(0)
+        source = f"sam2(client click: {len(labels) - n_neg}+/{n_neg}-)"
+        return mask, score, source
 
     if not os.environ.get('DISPLAY'):
         raise RuntimeError(
@@ -679,6 +734,11 @@ def add_model():
                                  if m.name != rec.name and rec.diameter > 0
                                  and abs(m.diameter - rec.diameter) / rec.diameter < 0.10],
         })
+    except ValueError as exc:
+        # A rejectable input (e.g. a point-cloud PLY with no faces): the client sent
+        # something unusable, so this is a 400, not a server fault.
+        logging.warning(f"rejected add_model upload: {exc}")
+        return jsonify({"status": "error", "message": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
         logging.exception("could not add the model")
         return jsonify({"status": "error", "message": str(exc)}), 500
@@ -692,11 +752,7 @@ def predict_pose():
         return jsonify({"status": "error",
                         "message": "busy with another request"}), 503
     try:
-        try:
-            K, rgb, depth = _receive_frame()
-        except ValueError as exc:
-            return jsonify({"status": "error", "message": str(exc)}), 400
-
+        K, rgb, depth = _receive_frame()
         mask, mask_score, mask_source = resolve_mask(SAM2, rgb)
         if not mask.any():
             return jsonify({"status": "error", "message": "the mask is empty"}), 400
@@ -789,6 +845,12 @@ def predict_pose():
             "artifacts": {name: base64.b64encode(payload).decode('ascii')
                           for name, payload in artifacts.items()},
         })
+    except ValueError as exc:
+        # A malformed payload or an unusable click: the client's fault, not ours.
+        # Kept distinct from the 500 below so a gesture client can tell "you sent
+        # me nonsense" from "the GPU pipeline fell over" and react accordingly.
+        logging.warning(f"rejected /predict_pose payload: {exc}")
+        return jsonify({"status": "error", "message": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001 - report anything back to the client
         logging.exception("registration failed")
         return jsonify({"status": "error", "message": str(exc)}), 500
