@@ -356,9 +356,26 @@ Nokta kameranın 13.5 cm sağında, 2.7 cm aşağısında, 50 cm ilerisinde.
 
 **Sahne bulutu:** N×6, N ≤ 2000, metre, kamera çerçevesi.
 
+**Neden 6 sütun?** Her satır bir noktadır. 6 sayı **konum + yüzey normali**dir,
+konum + yönelim (roll-pitch-yaw) **değil**:
+
+```
+   x,  y,  z   → noktanın konumu (metre)
+  nx, ny, nz   → o noktadaki yüzeyin dışa bakan dik doğrultusu (birim vektör, uzunluğu 1)
+```
+
+Bir noktanın kendi yönelimi olmaz. Normal, noktanın üzerinde bulunduğu **yüzeyin
+hangi yöne baktığını** söyler. Uzunluğu hep 1 olduğu için 3 sayıyla yazılır ama
+yalnızca 2 serbestlik derecesi taşır. Bir masanın üst yüzündeki her noktanın
+normali yukarı bakar. Bir kutunun yan yüzündeki noktalarınki yana bakar.
+
+Örneğin `(0.135, 0.027, 0.500, 0, 0, −1)` satırı şunu söyler: nokta kameranın 50 cm
+ilerisinde ve bu noktada yüzey dümdüz kameraya bakıyor. Kamera +Z yönüne baktığı
+için kameraya dönük bir yüzeyin normali −Z olur.
+
 Bu bulut **kısmi**: kamera nesneye tek yönden baktığı için yalnızca görünen yüzler
 var. Altı ve arkası yok. PPF ve FoundationPose bunu hesaba katacak şekilde
-çalışıyor (bkz. 8.5 ve 9.2).
+çalışıyor (bkz. 8.6 ve 9.2).
 
 ---
 
@@ -413,50 +430,139 @@ yapar):
 4. Model bulutu (**~600×6**), çapı ve boyutları `Data/ppf_library.npz` dosyasına
    kaydedilir.
 
-### 8.3 Eğitim: hash tablosu
+**Bu 600×6 hangi çerçevede?** Sahne bulutuyla aynı anlam (konum + normal), ama
+**hiçbir yere dönüştürülmemiş** hâlde: **CAD'in kendi çerçevesinde.** Orijin ve
+eksenler FreeCAD'de parça çizilirken neredeyse orada. Tek değişiklik mm → m
+ölçeklemesi.
 
-Her model için ayrı bir OpenCV dedektörü (`PPF3DDetector`) eğitilir:
+Yani elimizde iki ayrı çerçevede iki bulut var:
 
-1. Model bulutu, çapın %4'ü büyüklüğündeki voksellerle bir kez daha seyreltilir.
-2. **Bütün nokta çiftleri** için `F` hesaplanır.
-3. `F` nicelenir: uzaklık, çapın %4'ü genişliğinde kutulara, her açı 30 kutuya
-   (12°'lik) yerleştirilir. Yakın değerler aynı kutuya düşer, böylece gürültüye
+```
+  model bulutu  →  CAD çerçevesi    (offline, CAD'den)
+  sahne bulutu  →  kamera çerçevesi (canlı, depth görüntüsünden)
+
+  ikisini bağlayan dönüşüm  =  T  =  zaten bulmaya çalıştığımız poz
+```
+
+PPF'nin işe yaramasının sebebi de bu. 8.1'deki özellikler (uzaklık ve açılar) hangi
+çerçevede hesaplanırsa hesaplansın aynı çıkar. Bu yüzden T'yi bilmeden iki bulutu
+karşılaştırabiliyoruz.
+
+### 8.3 PPF3DDetector'ın iki fonksiyonu
+
+OpenCV'nin `PPF3DDetector` sınıfının dışarıya açık iki fonksiyonu var. İkisi de
+aynı özelliği (`F`) hesaplıyor ama farklı bulutlarda ve farklı amaçla:
+
+```
+  trainModel(model bulutu)     offline / açılışta   CAD bulutundan hash tablosu kurar
+  match(sahne bulutu)          her istekte          depth'ten gelen bulutun çiftlerini
+                                                    tabloda arar, oy toplar, poz önerir
+```
+
+Yani PPF **iki tarafta da** çalışıyor. Model tarafında sonuçlar tabloya **yazılıyor**,
+sahne tarafında (kameranın depth görüntüsünden üretilen bulutta) tabloda
+**aranıyor.** Kütüphanedeki her CAD'in kendi dedektörü, yani kendi tablosu var.
+Sahne bulutu sırayla her birinde aranıyor.
+
+### 8.4 Eğitim (`trainModel`): hash tablosu
+
+1. **OpenCV kendi seyreltmesini yapar.** Modelin sınırlayıcı kutusu her eksende 25
+   parçaya bölünür (adım 0.04 = 1/25). Aynı hücreye düşen noktaların konumları ve
+   normalleri ortalanır. 600 noktalık bulut bu adımdan sonra kütüphanemizde
+   **339–591 noktaya** iniyor (ör. `test_objv2_ear`: 600 → ~543).
+2. **Bütün sıralı çiftler** için `F` hesaplanır. Bu adımda kalan nokta sayısı
+   M olsun. Her nokta kendisi dışındaki her noktayla eşleşir:
+
+   ```
+   çift sayısı = M × (M − 1)          ← faktöriyel değil
+   ```
+
+   `test_objv2_ear` için 543 × 542 ≈ **294 000 çift.** Kütüphanede model başına
+   115 000 ile 349 000 arasında. Çiftler **sıralıdır**, yani (a, b) ile (b, a)
+   ayrı çiftlerdir. Çünkü `∠(n1, d)` ile `∠(n2, d)` yer değiştirince farklı bir
+   özellik çıkar. Sırasız sayılsaydı M(M−1)/2 olurdu. Faktöriyel (M!) ise bütün
+   noktaların dizilme sayısıdır, burada geçmiyor.
+3. Her çift için ayrıca bir **α_m açısı** saklanır. α_m şu demek: `m1` orijine
+   taşınıp normali x eksenine çevrildiğinde, `m2` x ekseni etrafında hangi açıda
+   duruyor? Bu açı eşleştirmede pozu bulmak için gerekli (8.5, 4. adım).
+4. `F` nicelenir: uzaklık, çapın %4'ü genişliğinde kutulara, her açı 12°'lik
+   kutulara bölünür (360° / 30). Yakın değerler aynı kutuya düştüğü için gürültüye
    dayanıklı olur.
-4. Nicelenmiş `F` bir **anahtar** olur. Hash tablosuna "bu anahtar modeldeki şu
-   çiftlerde görülüyor" yazılır.
+5. Nicelenmiş `F` bir **anahtar** olur. Hash tablosuna
+   `anahtar → [(m1, m2, α_m), …]` yazılır: "bu özellik modelde şu çiftlerde
+   görülüyor".
 
 Sonuçta elde bir matris yok, **"özellik → model çiftleri" sözlüğü** var. OpenCV
 bu tabloyu diske yazamadığı için sunucu her açılışta yeniden eğitiyor (model başına
 ~1–2 s). `.npz` dosyasında tablo değil, model bulutları duruyor.
 
-### 8.4 Eşleştirme: oylama
+### 8.5 Eşleştirme (`match`): oylama
 
 İki bulutun nokta sayısı ve sırası farklı. Hangi sahne noktasının hangi model
-noktasına karşılık geldiği bilinmiyor. PPF bunu **oylama** ile buluyor:
+noktasına karşılık geldiği bilinmiyor. PPF bunu **oylama** ile buluyor.
 
-1. Sahneden her 5 noktadan biri **referans nokta** `s_r` olarak seçilir.
-2. `s_r` diğer sahne noktalarıyla eşleştirilir ve her çift için `F(s_r, s_i)`
-   hesaplanır.
-3. Bu `F` hash tablosunda aranır. Bulunan her model çifti `(m_r, m_i)` bir öneri
-   yapar: "`s_r` aslında modeldeki `m_r` olabilir. İki çifti çakıştırmak için
-   normal etrafında `α` açısı kadar döndürmek gerekir."
-4. Öneri, `s_r`'ye ait oy tablosunun `[m_r, α]` hücresine **1 oy** ekler.
-5. En çok oy alan hücre en tutarlı eşleşmedir. `s_r ↔ m_r` ve `α`'dan bir **poz
-   hipotezi** (4×4) hesaplanır.
+**Rastgelelik yok, her şey sistematik.** Test karesinde (`test_objv2_ear`)
+ölçülen sayılarla:
+
+1. **Sahne de seyreltilir.** 2000 noktalık sahne bulutu 8.4'teki aynı 25×25×25
+   ızgarayla **~490 noktaya** iner. (2000 noktanın hepsi doğrulamada, 8.6'da,
+   kullanılıyor.)
+2. **Referans noktalar:** Bu ~490 noktanın listesinde **her 5. nokta** (0., 5.,
+   10., …) referans nokta `s_r` olur: **~98 referans nokta.**
+3. **Her `s_r`, kalan bütün sahne noktalarıyla** (`s_i`, ~489 nokta) eşleştirilir.
+   Seçme yok, komşuluk sınırı yok. Model başına ~98 × 489 ≈ **48 000 sahne çifti.**
+4. Her `(s_r, s_i)` çifti için:
+   - `F(s_r, s_i)` hesaplanıp tabloda aranır,
+   - sahne için de α_s açısı hesaplanır (8.4, 3. adımdaki gibi),
+   - tabloda bulunan her model çifti `(m_r, m_i, α_m)` bir öneri yapar:
+     "`s_r` aslında modeldeki `m_r` noktası. İki çifti çakıştırmak için normal
+     etrafında `α = α_m − α_s` kadar döndürmek gerekiyor",
+   - öneri, **o `s_r`'ye ait** oy tablosunun `[m_r, α]` hücresine **1 oy** ekler.
+     Tablonun boyutu: model nokta sayısı × 30 açı kutusu.
+5. `s_r`'nin bütün çiftleri bitince **oy tablosundaki en yüksek hücre** seçilir.
+   `s_r ↔ m_r` eşleşmesi ve `α` birlikte **tek bir tam poz** (4×4) verir:
+   - `s_r`'yi orijine taşıyıp normalini x eksenine çevir,
+   - x ekseni etrafında `α` kadar döndür,
+   - `m_r`'nin aynı işleminin tersini uygula.
+
+   Bu pozun **oy sayısı** o hücredeki oy sayısıdır.
 
 Yanlış eşleşmeler oylarını rastgele hücrelere dağıtır. Doğru eşleşme hep aynı
 hücreye oy yığar (Hough dönüşümü mantığı). Noktaların sırası ve sayısı bu yüzden
 önemli değil.
 
-### 8.5 Doğrulama: hangi model kazanır?
+### 8.6 Doğrulama: 12 poz hipotezi ve hangi modelin kazandığı
 
-Oy sayısı **farklı modeller arasında karşılaştırılamaz.** Çok noktalı, kendini
-tekrar eden yüzeyleri olan büyük bir model, sahnede olmasa bile küçük bir modelden
-fazla oy toplar. Bu yüzden her aday model için:
+**12 hipotez nereden geliyor?**
 
-1. En çok oy alan **12 poz hipotezi** alınır.
+```
+ ~98 referans nokta ──▶ her biri 1 poz ──▶ ~98 ham poz
+                                              │  birbirine yakın olanlar birleştirilir
+                                              ▼  (konum ve açı olarak yakın; oylar toplanır,
+                                                  pozların ortalaması alınır)
+                                         55 küme ── oy toplamına göre sıralı
+                                              │
+                                              ▼  bizim kod: ilk 12'yi al
+                                         12 poz hipotezi
+```
+
+- 5. adımda **her referans nokta bir poz önerir.** Referans nokta nesnenin doğru
+  bir yerindeyse bu poz doğru pozdur. Birçok referans nokta aynı doğru pozu bulur.
+- OpenCV birbirine yakın pozları **kümeler** ve oylarını toplar. Test karesinde
+  `test_objv2_ear` için ~98 ham poz **55 kümeye** indi. Kümelerin oyları
+  884, 583, 459, 334, … şeklinde sıralandı.
+- Bizim kod bu listenin **ilk 12'sini** alıyor (`n_hypotheses = 12`). Sadece birinciyi
+  almıyoruz, çünkü simetrik veya düz parçalarda en çok oyu yanlış bir yönelim
+  alabiliyor. İlk birkaç hipotezden biri doğruysa doğrulama onu bulur.
+
+**Model seçimi.** Oy sayısı **farklı modeller arasında karşılaştırılamaz.** Çok
+noktalı, kendini tekrar eden yüzeyleri olan büyük bir model, sahnede olmasa bile
+küçük bir modelden fazla oy toplar. Bu yüzden her aday model için:
+
+1. Yukarıdaki **12 poz hipotezi** alınır.
 2. Her biri **ICP** (Iterative Closest Point, 50 iterasyon) ile birkaç milimetre
-   düzeltilir. ICP iyi bir başlangıç pozu ister, onu PPF veriyor.
+   düzeltilir. ICP iyi bir başlangıç pozu ister, onu PPF veriyor. Ayrıca PPF'nin
+   12°'lik açı kutuları pozda küçük bir hata bırakıyor, ICP onu kapatıyor.
 3. Model bu pozda sahneye yerleştirilir. Kameradan **görülemeyecek** noktalar
    atılır: kameraya sırtını dönen yüzler ve modelin kendi kendini örttüğü kısımlar.
    Sahne kısmi olduğu için modelin de yalnızca görünen kısmıyla karşılaştırılması
@@ -479,9 +585,10 @@ ikisini de cezalandırır.
    Birinci ile ikinci arasındaki fark (**margin**) kararın ne kadar güvenli
    olduğunu gösterir.
 
-### 8.6 Boyut ön-filtresi
+### 8.7 Boyut ön-filtresi
 
-Eşleştirme pahalı olduğu için önce çok ucuz bir eleme yapılır. Sahne bulutunun
+Asıl maliyet doğrulamada (12 hipotez × ICP × skor), bu yüzden önce çok ucuz bir
+eleme yapılır. Sahne bulutunun
 çapı (noktalar arası uzaklıkların %99.5'lik değeri) her modelin çapıyla
 karşılaştırılır:
 
@@ -493,14 +600,14 @@ karşılaştırılır:
 Gerçek test karesinde 13 modelden 8'i burada elendi. Hepsi elenirse filtre yok
 sayılır ve bütün modeller puanlanır.
 
-### 8.7 PPF'nin pozu neden kullanılmıyor?
+### 8.8 PPF'nin pozu neden kullanılmıyor?
 
-8.4–8.5'te PPF bir poz hesaplıyor. Ama bu poz yalnızca skor için var: bir CAD'in
+8.5–8.6'da PPF bir poz hesaplıyor. Ama bu poz yalnızca skor için var: bir CAD'in
 bulutu açıklayıp açıklamadığını sormak için onu bir yere koymak gerekiyor. Bu poz
 sınıflandırıcıdan **dışarı çıkmıyor.** FoundationPose pozu sıfırdan hesaplıyor.
 FoundationPose'un daha doğru olduğu **varsayıldı, ölçülmedi** (bkz. Bölüm 14).
 
-### 8.8 Sınırlar
+### 8.9 Sınırlar
 
 - Ayırt edici özellik görünmüyorsa (ör. alt yüzdeki bir kabartma) tek görüşten
   ayırt edilemez. Margin küçülür. Bu bir hata değil, bilginin olmadığını gösteren
@@ -677,6 +784,8 @@ korundu.
 | Sunucu açılışı: FoundationPose ağları + PPF eğitimi + SAM2 | PPF model başına ~1–2 s | bir kez |
 | Tıklama | operatöre bağlı | `click` gönderilirse yok |
 | Nokta bulutu + PPF sınıflandırma | ~1.4 s (13 model) | ölçüldü |
+| └ bunun içinde `match` (oylama), model başına | ~0.07 s | ölçüldü (CPU, test karesi) |
+| └ geri kalanı: 12 hipotez × ICP + skor, her aday model için | baskın kısım | ayrıca ölçülmedi |
 | FoundationPose `register()` | cevapta `elapsed_sec` | ayrıca ölçülmedi |
 | Tüm zincir | gözlemle < 10 s | adım adım ölçülmedi |
 | (Eski SAM-6D hattı) | 1–1.5 dk | karşılaştırma için |
