@@ -81,17 +81,24 @@ Configuration (all optional, via env vars):
     EST_REFINE_ITER  refinement iterations in register()  (5)
     ZFAR             depth beyond this many metres is discarded (3.0)
     SAM2_CKPT/CFG    SAM2 checkpoint and its matching config
+    TIMING_CSV       every request's per-stage timings are appended here, one row
+                     per stage (and per CAD for PPF), for reporting. The same table
+                     is printed to the terminal and returned as `timings` in the
+                     reply.                  (Data/Output/timings.csv)
     PORT             (5000)
 """
 
 import io
 import os
 import sys
+import csv
 import json
 import time
+import datetime
 import base64
 import logging
 import threading
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -101,6 +108,7 @@ from flask import Flask, request, jsonify
 CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, CODE_DIR)
 
+import torch  # noqa: E402
 from estimater import (  # noqa: E402
     FoundationPose,
     ScorePredictor,
@@ -142,6 +150,8 @@ SAM2_CKPT = os.environ.get(
     "SAM2_CKPT", os.path.join(CODE_DIR, "weights", "sam2", "sam2.1_hiera_small.pt"))
 SAM2_CFG = os.environ.get("SAM2_CFG", "configs/sam2.1/sam2.1_hiera_s.yaml")
 
+TIMING_CSV = os.environ.get("TIMING_CSV", os.path.join(CODE_DIR, "Data", "Output", "timings.csv"))
+
 PORT = int(os.environ.get("PORT", "5000"))
 
 # In Docker we run as root on a bind-mounted workspace, so anything we write is
@@ -166,6 +176,128 @@ def _give_back_ownership(path):
         os.chown(path, int(HOST_UID), int(HOST_GID or HOST_UID))
     except OSError as err:
         logging.warning(f"could not chown {path} back to the host user: {err}")
+
+
+# ── Timing ────────────────────────────────────────────────────────────────
+
+class StageTimer:
+    """Wall-clock time of each pipeline stage for one request (or for startup).
+
+    Stages are recorded in order and do not overlap, so they add up to the total
+    minus Flask/JSON overhead. `report()` prints them as a table and appends them to
+    TIMING_CSV in long format -- one row per stage, plus one row per CAD for PPF --
+    which pivots straight into a per-stage / per-CAD table in a spreadsheet.
+
+    GPU work is asynchronous, so each stage synchronizes CUDA before reading the
+    clock; otherwise a kernel queued by one stage would be billed to the next.
+    """
+
+    _next_id = 1
+    FIELDS = ['timestamp', 'request_id', 'endpoint', 'status', 'object_name',
+              'stage', 'cad', 'seconds', 'detail']
+
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+        self.request_id = StageTimer._next_id
+        StageTimer._next_id += 1
+        self.timestamp = datetime.datetime.now().isoformat(timespec='seconds')
+        self.rows = []          # (stage, cad, seconds, detail)
+        self.status = 'error'   # flipped by the endpoint on success
+        self.object_name = ''
+        self._t0 = time.perf_counter()
+
+    @staticmethod
+    def _sync():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    @contextmanager
+    def stage(self, name, detail=''):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync()
+            self.add(name, time.perf_counter() - started, detail=detail)
+
+    def add(self, name, seconds, cad='', detail=''):
+        self.rows.append((name, cad, float(seconds), detail))
+
+    def add_ppf(self, report):
+        """Fold the classifier's own breakdown in: fixed costs, then each CAD."""
+        timing = report.get('timing')
+        if not timing:
+            return
+        self.add('ppf: scene prep + extent filter',
+                 timing['scene_prep_sec'] + timing['extent_filter_sec'])
+        if timing['lazy_train_sec'] > 0.001:
+            self.add('ppf: train (lazy)', timing['lazy_train_sec'])
+        detail = report.get('detail', {})
+        for name, t in timing['per_model'].items():
+            d = detail.get(name, {})
+            if d.get('rejected'):
+                note = f"rejected by extent filter: {d['rejected']}"
+            else:
+                note = (f"match={t['match_sec']:.3f}s verify={t['verify_sec']:.3f}s "
+                        f"score={d.get('score', 0.0):.3f}")
+            self.add('ppf: match + verify', t['elapsed_sec'], cad=name, detail=note)
+
+    def total(self):
+        return time.perf_counter() - self._t0
+
+    def operator_time(self):
+        """Seconds a human spent in the click window. Not compute; report it apart."""
+        return sum(sec for st, _, sec, _ in self.rows if st.startswith('operator'))
+
+    def as_dict(self):
+        """The JSON form that goes back to the client."""
+        total = self.total()
+        return {
+            'request_id': self.request_id,
+            'stages': [{'stage': st, 'cad': cad or None, 'seconds': round(sec, 4),
+                        **({'detail': det} if det else {})}
+                       for st, cad, sec, det in self.rows],
+            'total_sec': round(total, 4),
+            'compute_sec': round(total - self.operator_time(), 4),
+        }
+
+    def report(self):
+        total = self.total()
+        title = f"timing {self.endpoint} #{self.request_id}"
+        if self.object_name:
+            title += f"  object={self.object_name}"
+        lines = [f"── {title}  [{self.status}] " + "─" * max(0, 60 - len(title))]
+        for stage, cad, sec, det in self.rows:
+            label = f"    {cad}" if cad else stage
+            note = f"   {det}" if det else ""
+            lines.append(f"  {label:<38} {sec:8.3f} s{note}")
+        lines.append(f"  {'TOTAL':<38} {total:8.3f} s")
+        operator = self.operator_time()
+        if operator:
+            lines.append(f"  {'TOTAL excl. operator':<38} {total - operator:8.3f} s")
+        logging.info("\n" + "\n".join(lines))
+        self._append_csv(total, operator)
+
+    def _append_csv(self, total, operator):
+        try:
+            os.makedirs(os.path.dirname(TIMING_CSV), exist_ok=True)
+            new = not os.path.exists(TIMING_CSV)
+            with open(TIMING_CSV, 'a', newline='') as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(self.FIELDS)
+                base = [self.timestamp, self.request_id, self.endpoint, self.status,
+                        self.object_name]
+                for stage, cad, sec, det in self.rows:
+                    w.writerow(base + [stage, cad, f"{sec:.4f}", det])
+                w.writerow(base + ['TOTAL', '', f"{total:.4f}", ''])
+                if operator:
+                    w.writerow(base + ['TOTAL excl. operator', '',
+                                       f"{total - operator:.4f}", ''])
+            if new:
+                _give_back_ownership(TIMING_CSV)
+        except OSError as err:  # timing must never fail a request
+            logging.warning(f"could not append to {TIMING_CSV}: {err}")
 
 
 # ── Model loading (once, at startup) ──────────────────────────────────────
@@ -289,7 +421,7 @@ def cad_path_for(name):
     return path if os.path.exists(path) else None
 
 
-def classify_object(depth, K, mask):
+def classify_object(depth, K, mask, timer=None):
     """Mask + depth -> the name of the CAD to register against.
 
     Returns (cad_path, report). `report` is the full score table and always goes
@@ -305,7 +437,11 @@ def classify_object(depth, K, mask):
         return None, {'ok': False, 'message': 'classification is off'}
 
     started = time.monotonic()
+    t_cloud = time.perf_counter()
     pts, nrm = scene_cloud_from_mask(depth, K, mask)
+    if timer:
+        timer.add('mask -> scene point cloud', time.perf_counter() - t_cloud,
+                  detail=f"{len(pts)} pts")
     if len(pts) < 20:
         return None, {'ok': False, 'scores': {},
                       'message': f'only {len(pts)} points survived masking the depth'}
@@ -313,6 +449,8 @@ def classify_object(depth, K, mask):
     report = LIBRARY.classify(pts, nrm, K=K, q=QueryParams(
         tau_m=PPF_TAU, min_margin=PPF_MIN_MARGIN))
     report['elapsed_sec'] = round(time.monotonic() - started, 2)
+    if timer:
+        timer.add_ppf(report)
 
     if not report.get('ok'):
         return None, report
@@ -399,7 +537,8 @@ def click_for_mask(predictor, rgb):
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     win = "click the object  [L=object  R=not-object  u=undo  r=reset  ENTER=accept  ESC=abort]"
 
-    state = {'points': [], 'labels': [], 'mask': None, 'score': 0.0, 'dirty': False}
+    state = {'points': [], 'labels': [], 'mask': None, 'score': 0.0, 'dirty': False,
+             'sam2_sec': 0.0}
 
     def on_mouse(event, x, y, flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -418,8 +557,10 @@ def click_for_mask(predictor, rgb):
             if state['dirty']:
                 state['dirty'] = False
                 if state['points']:
+                    started = time.perf_counter()
                     state['mask'], state['score'] = sam2_mask(
                         predictor, rgb, state['points'], state['labels'])
+                    state['sam2_sec'] = time.perf_counter() - started
                 else:
                     state['mask'] = None
 
@@ -439,10 +580,10 @@ def click_for_mask(predictor, rgb):
             key = cv2.waitKey(20) & 0xFF
             if key in (13, 10):  # ENTER
                 if state['mask'] is not None and state['mask'].any():
-                    return state['mask'], state['score']
+                    return state['mask'], state['score'], state['sam2_sec']
                 logging.warning("nothing selected yet -- click the object first")
             elif key == 27:  # ESC
-                return None, 0.0
+                return None, 0.0, 0.0
             elif key == ord('r'):
                 state['points'].clear()
                 state['labels'].clear()
@@ -499,9 +640,14 @@ def parse_click(spec_json, labels_json, shape):
     return points, labels
 
 
-def resolve_mask(predictor, rgb):
+def resolve_mask(predictor, rgb, timer):
     """Mask, in order of preference: one uploaded by the client, click points
-    the client sent, or the interactive window."""
+    the client sent, or the interactive window.
+
+    Timing: `segmentation (SAM2)` is the network alone (image encoder + mask
+    decoder) for the mask that was used. In the interactive window the time the
+    operator spends clicking is human time, not compute, so it is recorded as its
+    own stage and should be left out of any latency figure."""
     if 'mask' in request.files:
         buf = np.frombuffer(request.files['mask'].read(), np.uint8)
         mask = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
@@ -512,7 +658,8 @@ def resolve_mask(predictor, rgb):
     click = request.form.get('click')
     if click:
         points, labels = parse_click(click, request.form.get('click_labels'), rgb.shape)
-        mask, score = sam2_mask(predictor, rgb, points, labels)
+        with timer.stage('segmentation (SAM2)'):
+            mask, score = sam2_mask(predictor, rgb, points, labels)
         n_neg = labels.count(0)
         source = f"sam2(client click: {len(labels) - n_neg}+/{n_neg}-)"
         return mask, score, source
@@ -523,7 +670,11 @@ def resolve_mask(predictor, rgb):
             "Run the container with X11 forwarding (docker/run_container_blackwell.sh "
             "already does), or have the client send a `mask` file or `click` field.")
 
-    mask, score = click_for_mask(predictor, rgb)
+    started = time.perf_counter()
+    mask, score, sam2_sec = click_for_mask(predictor, rgb)
+    timer.add('operator clicking (interactive)', time.perf_counter() - started - sam2_sec,
+              detail='human time, not compute')
+    timer.add('segmentation (SAM2)', sam2_sec, detail='last click')
     if mask is None:
         raise RuntimeError("operator aborted the selection")
     return mask, score, "sam2(interactive click)"
@@ -643,13 +794,18 @@ def classify():
     """
     if not _lock.acquire(blocking=False):
         return jsonify({"status": "error", "message": "busy with another request"}), 503
+    timer = StageTimer('/classify')
     try:
-        K, rgb, depth = _receive_frame()
-        mask, mask_score, mask_source = resolve_mask(SAM2, rgb)
+        with timer.stage('receive + decode frame'):
+            K, rgb, depth = _receive_frame()
+        mask, mask_score, mask_source = resolve_mask(SAM2, rgb, timer)
         if not mask.any():
             return jsonify({"status": "error", "message": "the mask is empty"}), 400
 
-        cad_path, report = classify_object(depth, K, mask)
+        cad_path, report = classify_object(depth, K, mask, timer)
+        if report.get('ok'):
+            timer.status = 'success'
+            timer.object_name = report.get('object_name') or ''
         return jsonify({
             "status": "success" if report.get('ok') else "error",
             "object_name": report.get('object_name'),
@@ -658,6 +814,7 @@ def classify():
             "mask_score": mask_score,
             "mask_source": mask_source,
             "classification": report,
+            "timings": timer.as_dict(),
         }), (200 if report.get('ok') else 422)
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
@@ -665,6 +822,7 @@ def classify():
         logging.exception("classification failed")
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
+        timer.report()
         _lock.release()
 
 
@@ -751,9 +909,11 @@ def predict_pose():
     if not _lock.acquire(blocking=False):
         return jsonify({"status": "error",
                         "message": "busy with another request"}), 503
+    timer = StageTimer('/predict_pose')
     try:
-        K, rgb, depth = _receive_frame()
-        mask, mask_score, mask_source = resolve_mask(SAM2, rgb)
+        with timer.stage('receive + decode frame'):
+            K, rgb, depth = _receive_frame()
+        mask, mask_score, mask_source = resolve_mask(SAM2, rgb, timer)
         if not mask.any():
             return jsonify({"status": "error", "message": "the mask is empty"}), 400
         if not (depth[mask] > 0.001).any():
@@ -767,7 +927,7 @@ def predict_pose():
         # PPF names the part; that name selects the mesh; FoundationPose then
         # estimates the pose from that mesh, from scratch. The classifier's own
         # internal pose hypotheses do not survive this line.
-        cad_path, report = classify_object(depth, K, mask)
+        cad_path, report = classify_object(depth, K, mask, timer)
         if cad_path is None:
             if PPF_STRICT and LIBRARY is not None:
                 return jsonify({
@@ -790,14 +950,17 @@ def predict_pose():
                 "classification": report,
             }), 422
 
-        mesh, to_origin, bbox = use_cad(cad_path)
+        with timer.stage('CAD load / switch'):
+            mesh, to_origin, bbox = use_cad(cad_path)
         object_name = os.path.splitext(os.path.basename(cad_path))[0]
+        timer.object_name = object_name
 
         logging.info(f"registering {object_name}: mask from {mask_source}, "
                      f"{int(mask.sum())} px")
         started = time.monotonic()
-        pose = EST.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
-                            iteration=EST_REFINE_ITER)
+        with timer.stage('FoundationPose register', f"{EST_REFINE_ITER} refine iters"):
+            pose = EST.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
+                                iteration=EST_REFINE_ITER)
         elapsed = time.monotonic() - started
 
         # The winning hypothesis' score from the scoring network. Note this is an
@@ -805,6 +968,7 @@ def predict_pose():
         # against each other -- it is NOT a probability like SAM-6D's score, so
         # don't carry a SAM-6D `min_score` threshold over unchanged.
         score = float(EST.scores[0]) if getattr(EST, 'scores', None) is not None else 0.0
+        artifacts_started = time.perf_counter()
         vis = render_overlay(rgb, pose, K, to_origin, bbox)
         mask_png = (mask.astype(np.uint8) * 255)
         pem_bytes, ism_bytes = sam6d_style_artifacts(mask, pose, score, object_name)
@@ -826,12 +990,15 @@ def predict_pose():
             with open(path, 'wb') as fh:
                 fh.write(payload)
             _give_back_ownership(path)
+        timer.add('overlay + artifacts', time.perf_counter() - artifacts_started)
+        timer.status = 'success'
 
         logging.info(f"registered {object_name} in {elapsed:.2f}s  score={score:.3f}  "
                      f"t={pose[:3, 3].round(4)}m")
         return jsonify({
             "status": "success",
             "elapsed_sec": round(elapsed, 2),
+            "timings": timer.as_dict(),
             "units": "m",
             "pose": pose.reshape(4, 4).tolist(),
             "score": score,
@@ -855,15 +1022,27 @@ def predict_pose():
         logging.exception("registration failed")
         return jsonify({"status": "error", "message": str(exc)}), 500
     finally:
+        timer.report()
         _lock.release()
 
 
 set_logging_format()
 set_seed(0)
 
-EST = load_estimator()
-LIBRARY = load_ppf_library()
-SAM2 = load_sam2()
+_startup = StageTimer('startup')
+with _startup.stage('load FoundationPose (scorer + refiner)'):
+    EST = load_estimator()
+with _startup.stage('load PPF library'):
+    LIBRARY = load_ppf_library()
+if LIBRARY is not None:
+    for _rec in LIBRARY.models:
+        if _rec.train_sec is not None:
+            _startup.add('ppf: train detector', _rec.train_sec, cad=_rec.name,
+                         detail=f"{len(_rec.cloud)} model pts (included above)")
+with _startup.stage('load SAM2'):
+    SAM2 = load_sam2()
+_startup.status = 'success'
+_startup.report()
 
 
 if __name__ == '__main__':

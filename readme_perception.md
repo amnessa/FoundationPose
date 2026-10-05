@@ -561,8 +561,52 @@ separate those; they compete on score alone.
 | `EST_REFINE_ITER` | `5` | FoundationPose refinement iterations |
 | `ZFAR` | `3.0` | depth beyond this many metres is discarded |
 | `SYMMETRY_INFO` | – | BOP-style symmetry info for symmetric parts |
+| `TIMING_CSV` | `Data/Output/timings.csv` | where per-stage timings are appended |
 
 Full list and PPF details: [docs/PPF.md](docs/PPF.md).
+
+### Timing
+
+Every request (and the server startup) is timed per stage. The same numbers go to
+three places:
+
+- **terminal**: a table printed after each request,
+- **`Data/Output/timings.csv`**: appended, one row per stage and one row per CAD for
+  PPF (columns `timestamp, request_id, endpoint, status, object_name, stage, cad,
+  seconds, detail`). It is long format: pivot on `stage` / `cad` in a spreadsheet,
+- **the reply**: a `timings` field with the stages, `total_sec` and `compute_sec`.
+
+Example (`/predict_pose`, warm server, RTX 5070 Ti, 14 CADs in the library):
+
+```
+── timing /predict_pose #3  object=test_objv2_ear  [success] ──────────────
+  receive + decode frame                    0.025 s
+  segmentation (SAM2)                       0.053 s
+  mask -> scene point cloud                 0.155 s   2000 pts
+  ppf: scene prep + extent filter           0.050 s
+      test_objv2_ear                        0.195 s   match=0.106s verify=0.089s score=0.764
+      test_objv2_base                       0.244 s   match=0.154s verify=0.090s score=0.210
+      ...
+      270circle                             0.000 s   rejected by extent filter: ...
+  CAD load / switch                         0.000 s
+  FoundationPose register                   1.198 s   5 refine iters
+  overlay + artifacts                       0.095 s
+  TOTAL                                     4.506 s
+```
+
+Notes for reading the numbers:
+
+- **The first request after startup is slower** (CUDA warm-up). Leave it out of
+  averages.
+- **Per-CAD PPF time** = `match` (OpenCV voting) + `verify` (ICP polish +
+  coverage·explained score). A CAD rejected by the size pre-filter costs 0 s.
+- **Interactive window:** the time the operator spends clicking is recorded as its
+  own stage (`operator clicking`) and excluded from `TOTAL excl. operator` /
+  `compute_sec`. `segmentation (SAM2)` is the network time for the last click only.
+- **`TOTAL` is wall-clock time** from the start of the request. It also includes small
+  untimed gaps, such as the depth check and the PPF result bookkeeping.
+- **Startup** rows show the one-off model loading and the PPF training time for each
+  CAD. Training runs inside `load PPF library`.
 
 ---
 

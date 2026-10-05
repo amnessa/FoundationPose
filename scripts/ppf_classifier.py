@@ -262,6 +262,7 @@ class ModelRecord:
     # loud at the moment the model enters the library.
     scale_warning: Optional[str] = None
     detector: object = field(default=None, repr=False)
+    train_sec: Optional[float] = None   # how long trainModel() took, for reporting
 
     def step(self, params: PPFParams) -> float:
         return self.sampling_step or params.relative_sampling_step
@@ -368,13 +369,14 @@ class PPFLibrary:
     # --- training --------------------------------------------------------
 
     def _train_one(self, rec: ModelRecord) -> None:
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         det = cv2.ppf_match_3d_PPF3DDetector(
             rec.step(self.params), self.params.relative_distance_step,
             self.params.num_angles)
         det.trainModel(rec.cloud)
         rec.detector = det
-        logging.info(f"  trained {rec.name} ({time.monotonic()-t0:.1f}s)")
+        rec.train_sec = time.perf_counter() - t0
+        logging.info(f"  trained {rec.name} ({rec.train_sec:.2f}s)")
 
     def train(self, names: Optional[Sequence[str]] = None) -> None:
         """Build the OpenCV hashtables. ~1-2s per model, hence `lazy` at the call site.
@@ -461,7 +463,7 @@ class PPFLibrary:
         """
         q = q or QueryParams()
         rng = np.random.default_rng(seed)
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
 
         if not self.models:
             return {'ok': False, 'message': 'the PPF library is empty', 'scores': {}}
@@ -475,6 +477,7 @@ class PPFLibrary:
         scene = np.hstack([scene_pts, scene_nrm]).astype(np.float32)
         scene_tree = cKDTree(scene_pts)
         scene_diam = cloud_diameter(scene_pts, rng=rng)
+        t_prep = time.perf_counter()
 
         # --- extent pre-filter -------------------------------------------
         rejected: Dict[str, str] = {}
@@ -502,8 +505,11 @@ class PPFLibrary:
             else:
                 logging.warning("extent pre-filter rejected every model; ignoring it")
                 rejected = {}
+        t_filter = time.perf_counter()
 
+        # Normally a no-op: the server trains every model at startup.
         self.train([m.name for m in candidates])
+        t_train = time.perf_counter()
 
         # --- match + verify ----------------------------------------------
         icp = cv2.ppf_match_3d_ICP(q.icp_iterations, 0.01, 2.5, 8) if q.icp_polish else None
@@ -515,8 +521,10 @@ class PPFLibrary:
                 results.append({'name': m.name, 'score': 0.0, 'coverage': 0.0,
                                 'explained': 0.0, 'votes': 0.0, 'visible_points': 0,
                                 'diameter_mm': round(m.diameter * 1000, 1),
+                                'match_sec': 0.0, 'verify_sec': 0.0, 'elapsed_sec': 0.0,
                                 'rejected': rejected[m.name]})
         results.sort(key=lambda r: r['score'], reverse=True)
+        t_end = time.perf_counter()
 
         top = results[0]
         runner_up = results[1]['score'] if len(results) > 1 else 0.0
@@ -535,23 +543,41 @@ class PPFLibrary:
             'rejected': rejected,
             'scene_points': int(len(scene_pts)),
             'scene_diameter_mm': round(scene_diam * 1000, 1),
-            'elapsed_sec': round(time.monotonic() - t0, 2),
+            'elapsed_sec': round(t_end - t0, 2),
+            # Where the time went. `per_model` is match (OpenCV voting) + verify
+            # (ICP polish and the coverage*explained score) for each CAD that survived
+            # the extent pre-filter; rejected CADs cost nothing and read 0.
+            'timing': {
+                'scene_prep_sec': round(t_prep - t0, 4),
+                'extent_filter_sec': round(t_filter - t_prep, 4),
+                'lazy_train_sec': round(t_train - t_filter, 4),
+                'match_verify_sec': round(t_end - t_train, 4),
+                'per_model': {r['name']: {'match_sec': r['match_sec'],
+                                          'verify_sec': r['verify_sec'],
+                                          'elapsed_sec': r['elapsed_sec']}
+                              for r in results},
+            },
         }
 
     def _score_model(self, m: ModelRecord, scene: np.ndarray, scene_pts: np.ndarray,
                      scene_tree: cKDTree, K, icp, q: QueryParams) -> Dict:
         out = {'name': m.name, 'score': 0.0, 'coverage': 0.0, 'explained': 0.0,
                'votes': 0.0, 'visible_points': 0,
-               'diameter_mm': round(m.diameter * 1000, 1)}
+               'diameter_mm': round(m.diameter * 1000, 1),
+               'match_sec': 0.0, 'verify_sec': 0.0, 'elapsed_sec': 0.0}
         tau = q.tau_m
+        t0 = time.perf_counter()
         try:
             poses = m.detector.match(scene, q.scene_sample_step, q.scene_relative_distance)
         except cv2.error as exc:
             out['error'] = str(exc).splitlines()[-1][:200]
             return out
+        finally:
+            out['match_sec'] = out['elapsed_sec'] = round(time.perf_counter() - t0, 4)
         if not poses:
             return out
 
+        t1 = time.perf_counter()
         for p in poses[:q.n_hypotheses]:
             T = np.asarray(p.pose, dtype=np.float64)
             if icp is not None:
@@ -562,6 +588,8 @@ class PPFLibrary:
                 out.update(score=float(score), coverage=float(cov),
                            explained=float(exp), visible_points=int(n_vis),
                            votes=float(p.numVotes))
+        out['verify_sec'] = round(time.perf_counter() - t1, 4)
+        out['elapsed_sec'] = round(time.perf_counter() - t0, 4)
         return out
 
 
