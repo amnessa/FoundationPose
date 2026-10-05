@@ -43,6 +43,18 @@ Mounts the repo at `/workspace/FoundationPose` and shares the host X socket, so 
 and Open3D debug windows work. It also mounts `~/.cache/torch_extensions` so nvdiffrast's
 JIT-compiled CUDA kernels are built once, not on every container start.
 
+### Other GPUs (RTX 4060 laptop, Ada / sm_89)
+
+The same Dockerfile works for older cards. Only the target arch changes:
+
+```bash
+docker build -f docker/Dockerfile.blackwell --build-arg TORCH_CUDA_ARCH_LIST=8.9 -t fp-sam2:ada .
+bash docker/run_container.sh
+```
+
+An image built for `12.0` will **not** run on a 4060. pytorch3d's kernels and nvdiffrast's JIT
+target are compiled for that arch only.
+
 ## First run, inside the container
 
 ```bash

@@ -58,6 +58,11 @@ Endpoints:
                          spending GPU time on a pose you are only going to look at.
     POST /add_model      upload a .ply, index it into the live library, persist it
     GET  /health         what is loaded, what is in the library
+    ws://:5001           live tracking (track_one per streamed frame). Protocol in
+                         fp_stream.py, server half in fp_tracking.py, design in
+                         realtime_fp.md. Shares the estimator and the GPU with the
+                         endpoints above: a /predict_pose pauses tracking, and its
+                         pose becomes the tracker's new starting point.
 
 Configuration (all optional, via env vars):
 
@@ -79,6 +84,12 @@ Configuration (all optional, via env vars):
                      picks an arbitrary member of the symmetry group and the pose
                      appears to flip between otherwise-identical runs.
     EST_REFINE_ITER  refinement iterations in register()  (5)
+    REGISTER_CROP    1 to register on the square around the mask that the networks
+                     actually look at (fp_stream.register_roi) instead of the whole
+                     frame. A full 1280x720 register needs more than the 8 GB of
+                     the laptop's RTX 4060, so docker/run_container.sh sets 1 there.
+                     Off by default: equivalence to the full-frame register is not
+                     yet verified on a frame with a real part in it.      (0)
     ZFAR             depth beyond this many metres is discarded (3.0)
     SAM2_CKPT/CFG    SAM2 checkpoint and its matching config
     TIMING_CSV       every request's per-stage timings are appended here, one row
@@ -86,6 +97,8 @@ Configuration (all optional, via env vars):
                      is printed to the terminal and returned as `timings` in the
                      reply.                  (Data/Output/timings.csv)
     PORT             (5000)
+    TRACK_ENABLE     1 to serve the live-tracking WebSocket, 0 to skip it   (1)
+    TRACK_PORT       its port                                            (5001)
 """
 
 import io
@@ -127,6 +140,7 @@ from ppf_classifier import (  # noqa: E402
     find_ply_files,
     scene_cloud_from_mask,
 )
+from fp_tracking import Tracker, TrackingServer, register_cropped  # noqa: E402
 
 app = Flask(__name__)
 
@@ -153,6 +167,9 @@ SAM2_CFG = os.environ.get("SAM2_CFG", "configs/sam2.1/sam2.1_hiera_s.yaml")
 TIMING_CSV = os.environ.get("TIMING_CSV", os.path.join(CODE_DIR, "Data", "Output", "timings.csv"))
 
 PORT = int(os.environ.get("PORT", "5000"))
+REGISTER_CROP = os.environ.get("REGISTER_CROP", "0") not in ("0", "false", "False")
+TRACK_ENABLE = os.environ.get("TRACK_ENABLE", "1") not in ("0", "false", "False")
+TRACK_PORT = int(os.environ.get("TRACK_PORT", "5001"))
 
 # In Docker we run as root on a bind-mounted workspace, so anything we write is
 # root-owned on the host and the host user can't overwrite it afterwards.
@@ -164,6 +181,10 @@ HOST_GID = os.environ.get("HOST_GID")
 # register() is GPU-bound and the click window is modal; two at once makes no
 # sense. Reject rather than queue, so a repeatedly-triggering client fails fast.
 _lock = threading.Lock()
+
+# Every use of EST (CAD switch, register, track_one) holds this. Unlike `_lock` it
+# blocks: the tracking thread waits out a registration instead of failing.
+GPU_LOCK = threading.Lock()
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -753,6 +774,7 @@ def health():
             "strict": PPF_STRICT,
             "tau_m": PPF_TAU,
         },
+        "tracking": TRACK_SERVER.health() if TRACK_SERVER is not None else None,
     })
 
 
@@ -950,18 +972,29 @@ def predict_pose():
                 "classification": report,
             }), 422
 
-        with timer.stage('CAD load / switch'):
-            mesh, to_origin, bbox = use_cad(cad_path)
         object_name = os.path.splitext(os.path.basename(cad_path))[0]
         timer.object_name = object_name
+        with timer.stage('wait for GPU (tracking)'):
+            GPU_LOCK.acquire()
+        try:
+            with timer.stage('CAD load / switch'):
+                mesh, to_origin, bbox = use_cad(cad_path)
 
-        logging.info(f"registering {object_name}: mask from {mask_source}, "
-                     f"{int(mask.sum())} px")
-        started = time.monotonic()
-        with timer.stage('FoundationPose register', f"{EST_REFINE_ITER} refine iters"):
-            pose = EST.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
-                                iteration=EST_REFINE_ITER)
-        elapsed = time.monotonic() - started
+            logging.info(f"registering {object_name}: mask from {mask_source}, "
+                         f"{int(mask.sum())} px")
+            started = time.monotonic()
+            with timer.stage('FoundationPose register', f"{EST_REFINE_ITER} refine iters"):
+                if REGISTER_CROP:
+                    pose = register_cropped(EST, K, rgb, depth, mask,
+                                            iteration=EST_REFINE_ITER)
+                else:
+                    pose = EST.register(K=K, rgb=rgb, depth=depth, ob_mask=mask,
+                                        iteration=EST_REFINE_ITER)
+            elapsed = time.monotonic() - started
+            if TRACKER is not None:
+                TRACKER.on_registered()
+        finally:
+            GPU_LOCK.release()
 
         # The winning hypothesis' score from the scoring network. Note this is an
         # unnormalized ranking score (tens, not 0-1) used to sort hypotheses
@@ -1043,6 +1076,23 @@ with _startup.stage('load SAM2'):
     SAM2 = load_sam2()
 _startup.status = 'success'
 _startup.report()
+
+
+def _use_cad_by_name(name):
+    """Tracking seeds name a CAD by its stem; resolve it like /predict_pose would."""
+    path = cad_path_for(name) or os.path.join(CAD_DIR, f"{name}.ply")
+    if not os.path.exists(path):
+        raise ValueError(f"no CAD named {name!r} in CAD_DIR={CAD_DIR}")
+    use_cad(path)
+
+
+TRACKER = TRACK_SERVER = None
+if TRACK_ENABLE:
+    TRACKER = Tracker(EST, GPU_LOCK, use_cad=_use_cad_by_name,
+                      register_iter=EST_REFINE_ITER, register_crop=REGISTER_CROP, zfar=ZFAR)
+    TRACK_SERVER = TrackingServer(TRACKER, port=TRACK_PORT)
+    if not TRACK_SERVER.start():
+        TRACKER = TRACK_SERVER = None
 
 
 if __name__ == '__main__':

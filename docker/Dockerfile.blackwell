@@ -14,8 +14,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 # sm_120 = Blackwell. Consumed by the pytorch3d source build below and, at runtime,
-# by nvdiffrast's JIT extension build.
-ENV TORCH_CUDA_ARCH_LIST="12.0" \
+# by nvdiffrast's JIT extension build. Override for other GPUs, e.g. the RTX 4060 laptop
+# (Ada, sm_89): --build-arg TORCH_CUDA_ARCH_LIST=8.9
+ARG TORCH_CUDA_ARCH_LIST="12.0"
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
     FORCE_CUDA=1 \
     CUDA_HOME=/usr/local/cuda \
     OPENCV_IO_ENABLE_OPENEXR=1
@@ -26,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libboost-system-dev libboost-program-options-dev libeigen3-dev \
       libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libgomp1 \
       libegl1 libgles2 libglvnd-dev freeglut3-dev \
+      libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python && python -m pip install --upgrade pip setuptools wheel

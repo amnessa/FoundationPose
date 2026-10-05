@@ -61,3 +61,112 @@ timestamp,request_id,endpoint,status,object_name,stage,cad,seconds,detail
 2026-10-05T12:44:02,3,/predict_pose,success,test_objv2_ear,FoundationPose register,,1.2412,5 refine iters
 2026-10-05T12:44:02,3,/predict_pose,success,test_objv2_ear,overlay + artifacts,,0.1002,
 2026-10-05T12:44:02,3,/predict_pose,success,test_objv2_ear,TOTAL,,5.0999,
+2026-10-05T17:49:25,1,startup,success,,load FoundationPose (scorer + refiner),,0.6870,
+2026-10-05T17:49:25,1,startup,success,,load PPF library,,19.9793,
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,270circle,1.2542,574 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,Tblock,1.9418,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,plate,1.4657,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,powerdrill,0.2200,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,smallplate,1.8829,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objectv1,0.7946,546 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objv1_base,1.0284,558 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objv1_ear,0.4580,350 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objv2,1.2343,576 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objv2_base,1.9879,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objv2_ear,1.5101,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,test_objv3,1.3570,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,vplate,2.8230,560 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,ppf: train detector,assembly_mesh,2.0053,600 model pts (included above)
+2026-10-05T17:49:25,1,startup,success,,load SAM2,,0.6631,
+2026-10-05T17:49:25,1,startup,success,,TOTAL,,21.3295,
+2026-10-05T17:52:24,1,startup,success,,load FoundationPose (scorer + refiner),,0.6205,
+2026-10-05T17:52:24,1,startup,success,,load PPF library,,19.2356,
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,270circle,0.9411,574 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,Tblock,1.9665,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,plate,1.5293,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,powerdrill,0.2440,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,smallplate,1.9533,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objectv1,0.8226,546 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objv1_base,1.0881,558 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objv1_ear,0.4780,350 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objv2,1.3268,576 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objv2_base,2.0336,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objv2_ear,1.0917,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,test_objv3,1.0264,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,vplate,2.6190,560 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,ppf: train detector,assembly_mesh,2.0971,600 model pts (included above)
+2026-10-05T17:52:24,1,startup,success,,load SAM2,,0.6308,
+2026-10-05T17:52:24,1,startup,success,,TOTAL,,20.4869,
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,receive + decode frame,,0.0458,
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,segmentation (SAM2),,0.4503,
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,mask -> scene point cloud,,0.4725,2000 pts
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: scene prep + extent filter,,0.1013,
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2_base,1.9260,match=1.824s verify=0.102s score=0.395
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2_ear,1.2505,match=1.141s verify=0.109s score=0.355
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,assembly_mesh,2.2237,match=2.102s verify=0.122s score=0.176
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2,1.5447,match=1.442s verify=0.103s score=0.131
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv3,1.3909,match=1.245s verify=0.145s score=0.018
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,powerdrill,0.5589,match=0.425s verify=0.134s score=0.017
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,270circle,0.0000,rejected by extent filter: scene 287mm exceeds CAD 158mm by 82%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,Tblock,0.0000,rejected by extent filter: scene 287mm exceeds CAD 181mm by 59%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,plate,0.0000,rejected by extent filter: scene 287mm exceeds CAD 180mm by 59%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,smallplate,0.0000,rejected by extent filter: scene 287mm exceeds CAD 112mm by 156%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objectv1,0.0000,rejected by extent filter: scene 287mm exceeds CAD 206mm by 39%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv1_base,0.0000,rejected by extent filter: scene 287mm exceeds CAD 206mm by 39%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv1_ear,0.0000,rejected by extent filter: scene 287mm exceeds CAD 114mm by 152%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,ppf: match + verify,vplate,0.0000,rejected by extent filter: scene 287mm exceeds CAD 176mm by 63%
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,CAD load / switch,,0.0233,
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,FoundationPose register,,4.1650,5 refine iters
+2026-10-05T17:55:14,2,/predict_pose,error,test_objv2_base,TOTAL,,14.1565,
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,receive + decode frame,,0.0330,
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,segmentation (SAM2),,0.1409,
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,mask -> scene point cloud,,0.4723,2000 pts
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: scene prep + extent filter,,0.1079,
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2_base,2.0443,match=1.944s verify=0.100s score=0.395
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2_ear,1.3010,match=1.185s verify=0.116s score=0.355
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,assembly_mesh,2.2416,match=2.121s verify=0.120s score=0.176
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2,1.3920,match=1.284s verify=0.108s score=0.131
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv3,1.3929,match=1.239s verify=0.154s score=0.018
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,powerdrill,0.5287,match=0.404s verify=0.125s score=0.017
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,270circle,0.0000,rejected by extent filter: scene 287mm exceeds CAD 158mm by 82%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,Tblock,0.0000,rejected by extent filter: scene 287mm exceeds CAD 181mm by 59%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,plate,0.0000,rejected by extent filter: scene 287mm exceeds CAD 180mm by 59%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,smallplate,0.0000,rejected by extent filter: scene 287mm exceeds CAD 112mm by 156%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objectv1,0.0000,rejected by extent filter: scene 287mm exceeds CAD 206mm by 39%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv1_base,0.0000,rejected by extent filter: scene 287mm exceeds CAD 206mm by 39%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv1_ear,0.0000,rejected by extent filter: scene 287mm exceeds CAD 114mm by 152%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,ppf: match + verify,vplate,0.0000,rejected by extent filter: scene 287mm exceeds CAD 176mm by 63%
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,CAD load / switch,,0.0001,
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,FoundationPose register,,2.6374,5 refine iters
+2026-10-05T17:56:06,3,/predict_pose,error,test_objv2_base,TOTAL,,12.2963,
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,receive + decode frame,,0.0381,
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,segmentation (SAM2),,0.1226,
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,mask -> scene point cloud,,0.4177,2000 pts
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: scene prep + extent filter,,0.0608,
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2_base,1.8040,match=1.695s verify=0.109s score=0.513
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2_ear,1.3424,match=1.222s verify=0.121s score=0.385
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,assembly_mesh,2.1905,match=2.072s verify=0.119s score=0.231
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv2,1.4741,match=1.354s verify=0.120s score=0.156
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv3,3.8830,match=1.265s verify=2.618s score=0.024
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,powerdrill,0.4608,match=0.340s verify=0.121s score=0.018
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,270circle,0.0000,rejected by extent filter: scene 285mm exceeds CAD 158mm by 80%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,Tblock,0.0000,rejected by extent filter: scene 285mm exceeds CAD 181mm by 58%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,plate,0.0000,rejected by extent filter: scene 285mm exceeds CAD 180mm by 58%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,smallplate,0.0000,rejected by extent filter: scene 285mm exceeds CAD 112mm by 154%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objectv1,0.0000,rejected by extent filter: scene 285mm exceeds CAD 206mm by 38%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv1_base,0.0000,rejected by extent filter: scene 285mm exceeds CAD 206mm by 38%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,test_objv1_ear,0.0000,rejected by extent filter: scene 285mm exceeds CAD 114mm by 150%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,ppf: match + verify,vplate,0.0000,rejected by extent filter: scene 285mm exceeds CAD 176mm by 62%
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,CAD load / switch,,0.0002,
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,FoundationPose register,,2.6313,5 refine iters
+2026-10-05T17:56:52,4,/predict_pose,error,test_objv2_base,TOTAL,,14.4320,
+2026-10-05T18:16:26,1,startup,success,,load FoundationPose (scorer + refiner),,1.0495,
+2026-10-05T18:16:26,1,startup,success,,load PPF library,,0.0002,
+2026-10-05T18:16:26,1,startup,success,,load SAM2,,1.0150,
+2026-10-05T18:16:26,1,startup,success,,TOTAL,,2.0648,
+2026-10-05T18:17:24,2,/predict_pose,success,test_objv2_ear,receive + decode frame,,0.0467,
+2026-10-05T18:17:24,2,/predict_pose,success,test_objv2_ear,wait for GPU (tracking),,0.0002,
+2026-10-05T18:17:24,2,/predict_pose,success,test_objv2_ear,CAD load / switch,,0.0000,
+2026-10-05T18:17:24,2,/predict_pose,success,test_objv2_ear,FoundationPose register,,3.7523,5 refine iters
+2026-10-05T18:17:24,2,/predict_pose,success,test_objv2_ear,overlay + artifacts,,0.1429,
+2026-10-05T18:17:24,2,/predict_pose,success,test_objv2_ear,TOTAL,,3.9538,
