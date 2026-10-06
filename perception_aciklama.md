@@ -6,8 +6,12 @@ anlatır. Her adımda verinin **şekli, birimi ve hangi koordinat çerçevesinde
 olduğu** yazılıdır. Kullanılan yöntemlerin (nokta bulutu, PPF, FoundationPose)
 nasıl çalıştığı da ayrı bölümlerde açıklanır.
 
+Parça bulunduktan sonra her karede takip edilmesi (FoundationPose `track_one`,
+laptop'un GPU'sunda) [Bölüm 12](#12-canlı-takip-foundationpose-laptopta)'de.
+
 Sunucu tarafının İngilizce teknik referansı (ayarlar, uç noktalar, hata
 belirtileri) için: [readme_perception.md](readme_perception.md).
+Canlı takibin tasarımı ve gerekçeleri için: [realtime_fp.md](realtime_fp.md).
 PPF ayrıntıları için: [docs/PPF.md](docs/PPF.md).
 
 ---
@@ -25,9 +29,10 @@ PPF ayrıntıları için: [docs/PPF.md](docs/PPF.md).
 9. [FoundationPose: parça nerede, nasıl duruyor?](#9-foundationpose-parça-nerede-nasıl-duruyor)
 10. [Sunucunun cevabı](#10-sunucunun-cevabı)
 11. [Laptop: cevabı almak ve yayınlamak](#11-laptop-cevabı-almak-ve-yayınlamak)
-12. [Her aşamada verinin özeti](#12-her-aşamada-verinin-özeti)
-13. [Süreler](#13-süreler)
-14. [Kontrol edilecekler ve açık sorular](#14-kontrol-edilecekler-ve-açık-sorular)
+12. [Canlı takip: FoundationPose laptop'ta](#12-canlı-takip-foundationpose-laptopta)
+13. [Her aşamada verinin özeti](#13-her-aşamada-verinin-özeti)
+14. [Süreler](#14-süreler)
+15. [Kontrol edilecekler ve açık sorular](#15-kontrol-edilecekler-ve-açık-sorular)
 
 ---
 
@@ -74,7 +79,9 @@ PPF ayrıntıları için: [docs/PPF.md](docs/PPF.md).
 │         • /perception/object_name  ("test_objv2_ear", latched)               │
 │                    │                                                         │
 │                    ▼                                                         │
-│        ICP düğümü: aynı isimli .ply'yi yükler, T'ye oturtur, takip eder      │
+│        takip, T'den başlayarak:                                              │
+│          • ICP düğümü: aynı isimli .ply'yi yükler, T'ye oturtur, takip eder  │
+│          • FoundationPose track_one, laptop GPU'sunda (yeni, Bölüm 12)       │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -121,7 +128,7 @@ dönüşüm bu hattın dışında, laptop'ta yapılıyor.
 kamerasına **hizalanması** gerekiyor. RealSense sürücüsü bunu
 `/camera/aligned_depth_to_color/image_raw` topic'inde yapıyor. Hizalanmamış bir
 depth aynı boyutta olsa bile pikseller kayık olur. Maske nesnenin yanındaki
-derinlikleri alır. Bkz. [Bölüm 14](#14-kontrol-edilecekler-ve-açık-sorular).
+derinlikleri alır. Bkz. [Bölüm 15](#15-kontrol-edilecekler-ve-açık-sorular).
 
 ---
 
@@ -605,7 +612,7 @@ sayılır ve bütün modeller puanlanır.
 8.5–8.6'da PPF bir poz hesaplıyor. Ama bu poz yalnızca skor için var: bir CAD'in
 bulutu açıklayıp açıklamadığını sormak için onu bir yere koymak gerekiyor. Bu poz
 sınıflandırıcıdan **dışarı çıkmıyor.** FoundationPose pozu sıfırdan hesaplıyor.
-FoundationPose'un daha doğru olduğu **varsayıldı, ölçülmedi** (bkz. Bölüm 14).
+FoundationPose'un daha doğru olduğu **varsayıldı, ölçülmedi** (bkz. Bölüm 15).
 
 ### 8.9 Sınırlar
 
@@ -679,8 +686,9 @@ Notlar:
 - Simetrik parçalarda (düz plakalar gibi) birden fazla poz aynı görünür.
   `SYMMETRY_INFO` verilmezse sonuç bu eşdeğer pozlar arasında atlayabilir.
 - FoundationPose'un bir **takip modu** da var (`track_one`): önceki pozdan başlayıp
-  her yeni karede sadece iyileştirme yapıyor. Sunucu bunu **kullanmıyor.** Takibi
-  laptop'taki ICP yapıyor.
+  her yeni karede sadece iyileştirme yapıyor. `/predict_pose` bunu kullanmıyor.
+  Laptop'ta, buradaki pozdan başlayarak canlı takip için kullanılıyor
+  ([Bölüm 12](#12-canlı-takip-foundationpose-laptopta)).
 
 **Son çalıştırmadan örnek** (`Data/Output/foundationpose_results/detection_pem.json`):
 parça `test_objv2_ear`, öteleme ≈ (164, 45, 499) mm. Yani kameradan yaklaşık 50 cm
@@ -753,13 +761,186 @@ korundu.
 
    İkisi de **latched** (`TRANSIENT_LOCAL`). Sonradan başlayan bir düğüm de son
    sonucu alır.
-6. **ICP düğümü:** Adı alır, **kendi CAD klasöründen aynı adlı `.ply`'yi**
-   yükler, `T` pozuna oturtur ve kameradan gelen canlı bulut üzerinde ICP ile
-   takibe başlar.
+6. **Takip**, iki yoldan biriyle:
+   - **ICP düğümü:** Adı alır, **kendi CAD klasöründen aynı adlı `.ply`'yi**
+     yükler, `T` pozuna oturtur ve kameradan gelen canlı bulut üzerinde ICP ile
+     takibe başlar.
+   - **`fp_tracker_node` (yeni):** Aynı `/perception/detections` mesajını başlangıç
+     pozu olarak alır ve her karede FoundationPose ile takip eder. Bkz.
+     [Bölüm 12](#12-canlı-takip-foundationpose-laptopta).
 
 ---
 
-## 12. Her aşamada verinin özeti
+## 12. Canlı takip: FoundationPose laptop'ta
+
+*6 Ekim 2026'da eklendi. Tasarım ve gerekçeler: [realtime_fp.md](realtime_fp.md).*
+
+Bölüm 5–11'deki kayıt (*registration*) "parça nerede?" sorusunu **bir kez**, 1–4
+saniyede cevaplıyor. Parçayı yerine konurken izlemek için FoundationPose'un ikinci
+modu, `track_one`, **her kamera karesinde** çalıştırılıyor. Önceki pozdan başlıyor ve
+onu iyileştirme ağının (*refiner*) 2 turuyla düzeltiyor. 252 hipotez yok, puanlama
+ağı yok. Bu yüzden saniyeler yerine onlarca milisaniye sürüyor.
+
+### 12.1 Kim ne yapıyor?
+
+Kayıt masaüstünde kalıyor. Takip **laptop'un kendi GPU'sunda** (RTX 4060), kameranın
+yanında çalışıyor. Böylece kamera kareleri ağdan geçmiyor. Masaüstüne her kayıt için
+yalnızca **bir kare** gidiyor.
+
+```
+ LAPTOP (kamera, ROS 2 Jazzy, RTX 4060)                        MASAÜSTÜ (RTX 5070 Ti)
+
+ kamera ─▶ foundationpose_bridge_node ── HTTP, 1 kare ─────▶ fp_server.py :5000
+                                       ◀─ poz + parça adı ──  /predict_pose (Bölüm 5–10)
+              │ /perception/detections (latched) = başlangıç pozu
+              ▼
+ kamera ─▶ fp_tracker_node  (ROS düğümü, laptop)
+  30 Hz       │  ▲
+              │  │  ws://127.0.0.1:5001, aynı makine, ham baytlar
+              ▼  │
+          fp_track_server.py  (laptop container'ı, fp-sam2:ada)
+          yalnızca refiner ağı, her karede track_one
+              │
+              ▼
+   /perception/fp/pose (PoseStamped)  +  TF camera_color_optical_frame → fp_object
+   (ICP düğümüyle aynı mesaj tipleri)
+```
+
+| parça | nerede | dosya |
+|---|---|---|
+| kayıt sunucusu | masaüstü container'ı | `scripts/fp_server.py` (görevi değişmedi) |
+| yalnızca takip yapan sunucu | laptop container'ı | `scripts/fp_track_server.py` |
+| takip durum makinesi + WebSocket sunucusu | iki sunucu da kullanıyor | `scripts/fp_tracking.py` |
+| mesaj protokolü (torch yok) | her yerde | `scripts/fp_stream.py` |
+| ROS istemcisi | laptop (welding_cell_ws) | `scripts/fp_tracker_node.py` |
+| ROS'suz test istemcisi | herhangi bir makine | `scripts/track_replay.py` |
+| GPU ölçümü | container | `scripts/track_bench.py` |
+
+**Aynı laptop'ta neden bir WebSocket var?** Container Ubuntu 22.04 / Python 3.10 ve
+içinde ROS yok. Çalışma alanı ROS 2 Jazzy / Python 3.12. Humble↔Jazzy DDS
+desteklenmiyor. Aynı makinede soket yalnızca birkaç milisaniyelik kopyalama
+maliyeti getiriyor.
+
+### 12.2 Bir kare, adım adım
+
+**Başlangıç (seed).** Bridge kayıt sonucunu `/perception/detections` üzerinden
+yayınlıyor (latched). Düğüm bunu takipçiye `start` mesajı olarak gönderiyor: poz `T`
+(4×4, kamera çerçevesi, metre), parça adı (`.ply`'yi seçer) ve tespitin zaman
+damgasındaki `T_base_cam` (TF'ten).
+
+**Her kare.** Düğüm en yeni RGB-D çiftini alıyor. En fazla 2 kare cevap bekliyor.
+Daha eskileri atlanıyor, **kuyruğa alınmıyor.**
+
+| | giriş | yapılan | çıkış |
+|---|---|---|---|
+| düğüm | `/camera/color/image_raw` (rgb8), `/camera/depth/image_rect_raw` (16UC1, mm), `camera_info`, TF | zaman damgasıyla eşleştir, görüntü anındaki `T_base_cam`'i bul, başlık + ham baytları paketle | tek bir ikili mesaj, 1280×720'de ~4.6 MB |
+| takipçi | başlık (sıra no, zaman, K, depth ölçeği, `T_base_cam`), RGB, depth | depth → metre; **robot hareketi tahmini** (aşağıda); `track_one`, 2 refiner turu; **uyum** kontrolü (aşağıda) | JSON: 4×4 poz veya boş, durum, uyum |
+| düğüm | cevap | TRACKING ise yayınla | `PoseStamped` + TF, **görüntünün** zaman damgasıyla |
+
+**Robot hareketini çıkarmak (*ego-motion*).** Kamera robotun bileğinde. Kol
+hareket edince duran parça görüntüde zıplıyor. Takipçi, takipten önce önceki pozu
+kameranın kendi hareketi kadar kaydırıyor:
+
+```
+poz_tahmin = inv(T_base_cam_şimdi) · T_base_cam_önceki · poz_önceki
+```
+
+Böylece `track_one` yalnızca parçanın kendi hareketini izliyor. TF yoksa bu adım
+atlanıyor ve kolun hareketi parça hareketi gibi görünüyor.
+
+**Uyum (*fit*): poz hâlâ doğru mu?** `track_one` bir poz döndürüyor ama puan
+vermiyor. Bu yüzden her karede CAD yeni pozda render ediliyor ve ölçülen derinlikle
+karşılaştırılıyor:
+
+```
+fit = (ölçülen derinliği render'a 10 mm'den yakın olan CAD pikselleri) / (render edilen CAD pikselleri)
+```
+
+**Durumlar:**
+
+```
+IDLE ──start──▶ TRACKING ──3 kare boyunca fit < 0.5──▶ LOST ──fit ≥ 0.6──▶ TRACKING
+```
+
+LOST iken:
+1. poz yayınlanmıyor (TF duruyor; yanlış bir şey gösterilmiyor),
+2. takipçi her karede son iyi pozdan ucuz bir deneme yapıyor (parçayı kısa süre
+   kapatan bir el için),
+3. düğüm her 3 s'de bir masaüstünden **tıklamasız** yeniden kayıt istiyor:
+   takipçiden CAD'in son iyi pozdaki silüetini (genişletilmiş) maske olarak alıyor,
+   o kareyi ve maskeyi `/predict_pose`'a gönderiyor, takibi cevaptan yeniden
+   başlatıyor.
+
+### 12.3 Ölçülenler (RTX 4060 laptop)
+
+`track_bench.py`, yalnızca GPU, kayıtlı 1280×720 kare, parça duruyor, her satır 200
+kare:
+
+| refiner turu | giriş | ms/kare ort. (p95) | hız | titreşim |
+|---|---|---|---|---|
+| 1 | tam kare | 28.3 (40.1) | 35 Hz | 0.5 mm, 0.16° |
+| 2 | tam kare | 43.2 (59.9) | 23 Hz | 0.5 mm, 0.19° |
+| 1 | ROI kırpma 524×478 | 23.6 (34.8) | 42 Hz | 0.7 mm, 0.22° |
+| 2 | ROI kırpma | 38.8 (56.1) | 26 Hz | 0.7 mm, 0.27° |
+
+Yalnızca takip yapan sunucu ~250 MB GPU belleği kullanıyor.
+
+`fp_tracker_node` uçtan uca: kameranın yerine kayıtlı kareyi 30 Hz'de yayınlayan
+bir test düğümü, iki sunucu da aynı 4060'ta:
+
+| | sonuç | hedef |
+|---|---|---|
+| `/perception/fp/pose` hızı | 25–29 Hz | ≥ 15 Hz (amaç 30) |
+| görüntü zamanı → poz | 70–90 ms (ham bayt); JPEG/PNG ile ~100 ms | ≤ 100 ms (amaç 50) |
+| görüntü 1.5 s karartıldı | 3 karede LOST, kendiliğinden döndü (fit 0.90) | |
+| `/predict_pose` ile yeniden kayıt | 3.9–4.0 s, takip yeniden başladı | |
+
+Aynı GPU'da bir kayıt sürerken takip ~8 Hz'e düştü. Gerçek düzende kaydı masaüstü
+kendi GPU'sunda yapıyor, bu düşüş olmuyor.
+
+### 12.4 Notlar ve sınırlar
+
+- **Kayıt laptop'a sığmıyor.** Tam karede `register()` 8 GB'tan fazlasını istiyor:
+  scorer 252 hipotezin hepsini aynı anda tam kare boyutuna çeviriyor (tek seferde
+  2.6 GB). `REGISTER_CROP=1` kareyi ağların baktığı bölgeye kırpıyor ve sığıyor
+  (en çok 4.3 GB). Ama aynı pozu verdiği **doğrulanmadı.** Bu yüzden varsayılanı
+  kapalı, yalnızca tek makinede test için kullanılıyor.
+- **Uyum kontrolü düz yüzeydeki düz parçalarda yanılıyor.** Masada yatan ince bir
+  plaka, düzlem içinde nerede durursa dursun derinliğe uyuyor. Test karesinde
+  yanlış bir poz 0.94 aldı.
+- **Test karesinde gerçek bir parça yok.** Maskesi düz plaka üzerinde bir şerit.
+  Hız, gecikme ve LOST mantığı ölçüldü; **takibin poz doğruluğu ölçülmedi.**
+  Sıradaki iş: gerçek bir parçanın hareket ettiği bir dizi kaydetmek.
+- **Başlangıç pozunun zaman damgası.** Bridge `/perception/detections`'ı yayın
+  anıyla damgalıyor, yakalanan karenin zamanıyla değil. Kol, kare yakalandıktan
+  sonra ve cevap gelmeden hareket ederse başlangıç pozu o kadar kayık oluyor.
+  Küçük kaymaları takip topluyor, büyükleri LOST ve yeniden kayıtla bitiyor.
+  Bridge'te düzeltme: `out.header.stamp = frozen.stamp`.
+- **Varsayılan tam kare.** Düğüm parçanın etrafını kırpabiliyor (`use_roi`). Ama
+  takipçi aynı makinede olduğu için kazanç az.
+- ICP değişmedi ve hareketsiz adımları (`save_object`, `refine_pose`) hâlâ o
+  yapıyor. ICP düğümünün takibi `/perception/fp/pose`'a bırakması
+  (`tracking_source: fp`) sıradaki adım (realtime_fp.md, adım 6).
+
+### 12.5 Çalıştırmak
+
+```bash
+# laptop imajı bir kez (Ada, sm_89)
+docker build -f docker/Dockerfile.blackwell --build-arg TORCH_CUDA_ARCH_LIST=8.9 -t fp-sam2:ada .
+docker/run_container.sh                    # laptop container'ı
+python scripts/fp_track_server.py          # içinde: 127.0.0.1:5001
+
+# laptop, ROS 2
+ros2 run admittance_control fp_tracker_node.py --ros-args \
+    -p register_url:=http://<masaüstü>:5000/predict_pose
+```
+
+Servisler: `~/start` (son tespitten takibe başla), `~/stop`, `~/reseed`. Bütün
+parametreler: [readme_perception.md](readme_perception.md).
+
+---
+
+## 13. Her aşamada verinin özeti
 
 | # | nerede | veri | şekil | birim | çerçeve |
 |---|---|---|---|---|---|
@@ -774,10 +955,12 @@ korundu.
 | 9 | sunucu | poz `T` | 4×4 | m | kamera (CAD → kamera) |
 | 10 | sunucu → laptop | JSON + dosyalar | `pose` 4×4, `t` (pem) | **m** (JSON) / **mm** (pem) | kamera |
 | 11 | laptop | `Detection3DArray` | konum + quaternion | m | `camera_color_optical_frame` |
+| 12 | laptop (her kare) | takipçiye giden kare | RGB 720×1280×3 + depth 720×1280 uint16 + `T_base_cam` 4×4 | mm / m | piksel / `base_link` |
+| 13 | laptop (her kare) | `PoseStamped` + TF → `fp_object` | konum + quaternion | m | `camera_color_optical_frame` |
 
 ---
 
-## 13. Süreler
+## 14. Süreler
 
 | aşama | süre | durum |
 |---|---|---|
@@ -789,10 +972,13 @@ korundu.
 | FoundationPose `register()` | cevapta `elapsed_sec` | ayrıca ölçülmedi |
 | Tüm zincir | gözlemle < 10 s | adım adım ölçülmedi |
 | (Eski SAM-6D hattı) | 1–1.5 dk | karşılaştırma için |
+| Takip, kare başına (`track_one` + uyum), RTX 4060 | 28 ms (1 tur) / 43 ms (2 tur) | ölçüldü (`track_bench.py`) |
+| Takip, görüntü zamanı → yayınlanan poz | 70–90 ms, 25–29 Hz | ölçüldü (test kamerası, iki sunucu aynı GPU'da) |
+| LOST sonrası yeniden kayıt (masaüstü üzerinden) | 1 kare + `/predict_pose` | 4060'ta 3.9–4.0 s; masaüstünde ölçülmedi |
 
 ---
 
-## 14. Kontrol edilecekler ve açık sorular
+## 15. Kontrol edilecekler ve açık sorular
 
 **Kontrol edilecekler:**
 
@@ -808,12 +994,19 @@ korundu.
       yeterli.
 - [ ] **`assembly_mesh.ply`** kütüphanede olmalı mı? `CAD_DIR` içinde durduğu için
       şu an aday.
+- [ ] **Canlı takip, gerçek parçayla.** Hareket eden gerçek bir parçanın kaydını
+      al; takibin doğruluğunu ve uyum (fit) eşiğini onunla kontrol et (Bölüm 12.4).
+- [ ] **Bridge'in zaman damgası:** `/perception/detections`, yakalanan karenin
+      zamanını taşımalı (`frozen.stamp`).
 
 **Toplantıdan (1 Ekim 2026) gelen açık sorular:**
 
 - [ ] PPF pozu ile FoundationPose pozunu 3–5 farklı sahnede karşılaştır (doğruluk +
       süre). FoundationPose kullanmanın gerekçesi bu tablo olmalı.
-- [ ] FoundationPose takibi (`track_one`) ile ICP takibini karşılaştır.
+- [ ] FoundationPose takibi (`track_one`) ile ICP takibini karşılaştır. Takip yolu
+      artık var (Bölüm 12): parça dururken ve hareket ederken
+      `/perception/fp/pose` ve `/perception/icp/refined_pose` üzerinde
+      `pose_jitter_probe.py` çalıştır.
 - [ ] Süreleri adım adım ölç: SAM2, model başına PPF, FoundationPose.
 - [ ] D435i'nin en doğru ölçtüğü mesafeyi bul. Minimum mesafe ~28 cm, ama doğruluk
       nerede en iyi? `PPF_TAU` (8 mm) buna göre ayarlanmalı.

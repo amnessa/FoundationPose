@@ -18,6 +18,7 @@ convention as /predict_pose), so seeding converts with `inv(tf_to_centered)`.
 Ego-motion prediction is a left-multiply (camera side only) and needs no conversion.
 """
 
+import base64
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ DEFAULTS = {
     "lost_frames": 3,
     "ego_motion": True,        # predict with T_base_cam before tracking (S7)
     "auto_reseed": True,       # LOST -> register() on a mask projected from the last good pose
+                               # (only where this process can register; see can_register)
     "reseed_interval_s": 1.0,  # register is ~1 s of GPU; do not hammer it
     "reseed_dilate": 0.25,     # mask dilation, as a fraction of the crop radius
 }
@@ -86,11 +88,17 @@ class Tracker:
     `use_cad(name)` switches EST to the named CAD (the server's own helper);
     `register_iter`, `register_crop` and `zfar` mirror the server's registration
     settings (the auto re-seed registers the same way /predict_pose does).
+
+    `can_register=False` is the tracking-only process (fp_track_server.py): there is
+    no scorer network, so LOST never triggers a local register(). The client re-seeds
+    instead: it asks for a mask (`want_reseed_mask` on a frame), sends that frame and
+    mask to the registration server's /predict_pose, and starts again from the pose.
     """
 
     def __init__(self, est, gpu_lock, use_cad=None, register_iter=5, register_crop=False,
-                 zfar=3.0):
+                 can_register=True, zfar=3.0):
         self.est = est
+        self.can_register = can_register
         self.register_crop = register_crop
         self.gpu_lock = gpu_lock
         self.use_cad = use_cad
@@ -186,7 +194,8 @@ class Tracker:
             log.info(f"tracking {self.object_name} (seed={seed}, "
                      f"refine_iter={opts['refine_iter']}, ego_motion={opts['ego_motion']})")
             return {"type": "started", "state": self.state, "object_name": self.object_name,
-                    "diameter_m": float(self.est.diameter), "seed": seed}
+                    "diameter_m": float(self.est.diameter), "seed": seed,
+                    "can_register": self.can_register}
 
     def stop(self):
         with self.gpu_lock:
@@ -264,7 +273,27 @@ class Tracker:
                 reply["pose"] = self._to_cad(pose_c).tolist()
                 # No hint while LOST: the client then sends the full frame.
                 reply["hint"] = self._hint(pose_c, K_full)
+            if header.get("want_reseed_mask"):
+                t = time.perf_counter()
+                reply["reseed_mask_png"] = self._reseed_mask_png(K_full, header, T_now)
+                timings["reseed_mask_ms"] = (time.perf_counter() - t) * 1e3
         return reply, timings
+
+    def _reseed_mask_png(self, K_full, header, T_now):
+        """The CAD's silhouette at the last good pose (ego-predicted to this frame),
+        dilated, full-frame size, as base64 PNG (0/255). It is what the client sends
+        with this frame to /predict_pose as `mask` to re-register without a click.
+        None if there is no good pose yet or it projects off the frame."""
+        if self._good is None:
+            return None
+        good = self._good
+        if self.opts["ego_motion"]:
+            good = fs.predict_ego(good, self._good_T, T_now)
+        mask = self._projected_mask(good, K_full, tuple(header["full_hw"]))
+        if mask is None:
+            return None
+        ok, buf = cv2.imencode(".png", mask.astype(np.uint8) * 255)
+        return base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
 
     def _recover(self, rgb, depth, depth_t, K, T_now, timings, reply):
         """LOST: first a cheap track_one from the last good pose (the part may just
@@ -280,7 +309,7 @@ class Tracker:
         fit, cov = self._fit(pose_c, depth_t, K)
         timings["track_ms"] = (time.perf_counter() - t) * 1e3
 
-        if fit < self.opts["fit_recover"] and self.opts["auto_reseed"] and \
+        if fit < self.opts["fit_recover"] and self.opts["auto_reseed"] and self.can_register and \
                 time.monotonic() - self._last_reseed >= self.opts["reseed_interval_s"]:
             self._last_reseed = time.monotonic()
             t = time.perf_counter()
@@ -343,6 +372,10 @@ class TrackingServer:
         threading.Thread(target=self._run, name=f"{_THREAD_PREFIX}-server",
                          daemon=True).start()
         return True
+
+    def run(self):
+        """Serve in the calling thread (blocks). `start()` does this in a thread."""
+        self._run()
 
     def _run(self):
         from websockets.sync.server import serve

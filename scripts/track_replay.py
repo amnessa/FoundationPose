@@ -1,38 +1,43 @@
 #!/usr/bin/env python3
 """Simulated tracking client: what fp_tracker_node will do, minus ROS.
 
-Streams a saved frame to the tracking endpoint at the camera's rate, exactly the way
-the ROS node is meant to (realtime_fp.md S2, S3, S5): never waits for a reply before
-the next frame, at most --max-in-flight frames outstanding (extra camera frames are
-skipped, not queued), JPEG rgb + lossless PNG depth, full frame (--roi to crop to the
-server's hint instead). Only the pose comes back.
+The split it simulates: registration on the desktop (fp_server.py /predict_pose,
+one frame per part), tracking on the laptop (fp_track_server.py, every frame, over
+localhost). Only the registration frames cross the network.
 
-No torch, no ROS: needs numpy, OpenCV and websocket-client only, so it runs on the
-host as well as in the container.
+    1. POST one frame + mask to --register-url (/predict_pose)  -> pose, object name
+    2. `start` the tracker at --url with that pose
+    3. stream frames at the camera's rate: never wait for a reply before the next
+       frame, at most --max-in-flight outstanding (extra camera frames are skipped,
+       not queued), full frame (--roi to crop to the server's hint)
+    4. on LOST: ask the tracker for a mask on one frame (`want_reseed_mask`), POST that
+       frame + mask to /predict_pose, `start` again from the answer. Streaming goes on
+       meanwhile; the tracker may also recover by itself.
 
-    # one machine: server in the container (--network=host), client anywhere here
+No torch, no ROS: numpy, OpenCV and websocket-client only, so it runs on the host.
+
+    # one machine, both roles (two processes in the laptop container):
+    #   REGISTER_CROP=1 TRACK_ENABLE=0 PPF_ENABLE=0 python scripts/fp_server.py
+    #   python scripts/fp_track_server.py
     python3 scripts/track_replay.py
-    # two machines: run this on the laptop, the server on the desktop
-    python3 scripts/track_replay.py --url ws://<desktop>:5001
-    # simulate motion: the image slides +-40 px at 0.5 Hz, the pose must follow
-    python3 scripts/track_replay.py --wobble 40 --wobble-hz 0.5
+    # the real split: tracker local, registration on the desktop
+    python3 scripts/track_replay.py --register-url http://<desktop>:5000/predict_pose
+    # motion, a covered part, a forced re-seed through the registration server
+    python3 scripts/track_replay.py --wobble 40 --blackout 5 1.5 --force-reseed-at 10
 
-Seeding (--seed): `register` (default) posts the frame + --mask to /predict_pose and
-tracks from that registration, which is the real flow; `pose` uses a saved
-detection_pem.json; `last` continues from whatever the server registered last.
+Seeding (--seed): `register` (default) as above; `pose` uses a saved
+detection_pem.json instead of step 1; `last` continues from the tracker's own last
+registration (only when the tracker *is* fp_server.py).
 """
 
 import argparse
+import base64
 import json
 import os
 import socket
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
 
 import cv2
 import numpy as np
@@ -52,15 +57,14 @@ RESULTS = os.path.join(CODE_DIR, "Data", "Output", "foundationpose_results")
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--url", default=f"ws://127.0.0.1:{fs.DEFAULT_PORT}")
+    p.add_argument("--url", default=f"ws://127.0.0.1:{fs.DEFAULT_PORT}",
+                   help="the tracker (fp_track_server.py, or fp_server.py's endpoint)")
+    p.add_argument("--register-url", default="http://127.0.0.1:5000/predict_pose",
+                   help="the registration server's /predict_pose (the desktop)")
     p.add_argument("--frame-dir", default=os.path.join(CODE_DIR, "Data", "Input"))
-    p.add_argument("--seed", choices=["register", "pose", "last"], default="register",
-                   help="register: POST the frame + --mask to /predict_pose, then track "
-                        "from that (the real flow); pose: --detection file; last: the "
-                        "server's last registration")
-    p.add_argument("--http-port", type=int, default=5000)
+    p.add_argument("--seed", choices=["register", "pose", "last"], default="register")
     p.add_argument("--mask", default=os.path.join(RESULTS, "mask.png"),
-                   help="object mask for --seed register")
+                   help="object mask for the first registration")
     p.add_argument("--detection", default=os.path.join(RESULTS, "detection_pem.json"),
                    help="seed pose + object name for --seed pose")
     p.add_argument("--rate", type=float, default=30.0, help="camera rate, Hz")
@@ -73,9 +77,18 @@ def parse_args():
     p.add_argument("--depth-enc", choices=["png", "raw"], default="png")
     p.add_argument("--jpeg-quality", type=int, default=90)
     p.add_argument("--refine-iter", type=int, default=2)
+    p.add_argument("--no-reseed", action="store_true",
+                   help="on LOST, do not re-register through --register-url")
+    p.add_argument("--reseed-interval", type=float, default=3.0,
+                   help="seconds between re-registration attempts")
     p.add_argument("--wobble", type=float, default=0.0,
                    help="slide the image by this many px (sine) to simulate motion")
     p.add_argument("--wobble-hz", type=float, default=0.5)
+    p.add_argument("--blackout", type=float, nargs=2, metavar=("START", "SECONDS"),
+                   help="blank rgb + depth for a while: the part is 'covered' -> LOST")
+    p.add_argument("--force-reseed-at", type=float, metavar="SECONDS",
+                   help="re-register once at this time even while tracking, to "
+                        "exercise the whole re-seed path")
     return p.parse_args()
 
 
@@ -89,48 +102,25 @@ def load_frame(frame_dir):
     return K, scale_m, rgb, depth
 
 
-def register_over_http(args):
-    """The frame + mask to /predict_pose, as the bridge node does. The tracker then
-    starts from that registration (seed 'last')."""
-    host = urllib.parse.urlparse(args.url).hostname
-    url = f"http://{host}:{args.http_port}/predict_pose"
-    boundary = uuid.uuid4().hex
-    parts = []
-    for field, path in (("rgb", "rgb.png"), ("depth", "depth.png"),
-                        ("camera", "camera.json")):
-        with open(os.path.join(args.frame_dir, path), "rb") as fh:
-            parts.append((field, path, fh.read()))
-    with open(args.mask, "rb") as fh:
-        parts.append(("mask", "mask.png", fh.read()))
-    body = b"".join(
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{f}\"; "
-        f"filename=\"{n}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode()
-        + data + b"\r\n" for f, n, data in parts) + f"--{boundary}--\r\n".encode()
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": f"multipart/form-data; boundary={boundary}"})
-    t = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            reply = json.loads(resp.read())
-    except urllib.error.HTTPError as err:
-        sys.exit(f"/predict_pose failed: {err.code} {err.read()[:300]!r}")
-    print(f"registered {reply.get('object_name')} via {url} in {time.time() - t:.1f} s "
-          f"(score {reply.get('score', 0):.1f})")
-
-
-def seed_message(args):
-    seed = "last" if args.seed == "register" else args.seed
-    msg = {"type": "start", "seed": seed, "refine_iter": args.refine_iter,
+def start_message(args, pose=None, object_name=None):
+    msg = {"type": "start", "refine_iter": args.refine_iter,
            # no robot here, so no T_base_cam: the wobble is "the part moving"
            "ego_motion": False}
-    if args.seed == "pose":
-        with open(args.detection) as fh:
-            det = json.load(fh)[0]
-        T = np.eye(4)
-        T[:3, :3] = np.asarray(det["R"])
-        T[:3, 3] = np.asarray(det["t"]) / 1000.0  # SAM-6D file: mm
-        msg.update(pose=T.reshape(-1).tolist(), object=det.get("obj_name"))
+    if pose is None:
+        msg["seed"] = "last"
+    else:
+        msg.update(seed="pose", pose=np.asarray(pose).reshape(-1).tolist(),
+                   object=object_name)
     return msg
+
+
+def detection_pose(path):
+    with open(path) as fh:
+        det = json.load(fh)[0]
+    T = np.eye(4)
+    T[:3, :3] = np.asarray(det["R"])
+    T[:3, 3] = np.asarray(det["t"]) / 1000.0  # SAM-6D file: mm
+    return T, det.get("obj_name")
 
 
 def shifted(img, dx, interp):
@@ -142,8 +132,8 @@ def shifted(img, dx, interp):
 
 
 class Client:
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, args, K, scale_m):
+        self.args, self.K, self.scale_m = args, K, scale_m
         self.ws = websocket.create_connection(
             args.url, timeout=60, enable_multithread=True,
             sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),))
@@ -154,16 +144,27 @@ class Client:
         self.replies = []      # (t_reply, reply, frame meta)
         self.meta = {}         # seq -> (stamp, bytes, encode_ms, roi, dx)
         self.errors = 0
+        self.can_register = None
+        # re-seeding through the registration server
+        self.reseed_frames = {}  # seq -> (rgb, depth) of a frame we asked a mask for
+        self.reseed_busy = False
+        self.reseed_asked = 0.0
+        self.reseeds = []        # (ok, seconds, message)
 
     def start(self, msg):
+        """The first `start`, synchronously, before the receiver thread runs."""
         self.ws.send(json.dumps(msg))
         reply = json.loads(self.ws.recv())
         if reply.get("type") != "started":
-            sys.exit(f"server refused to start: {reply}")
-        self.state = reply["state"]
-        print(f"tracking {reply['object_name']} (diameter {reply['diameter_m'] * 1000:.0f} mm, "
-              f"seed {reply['seed']})")
+            sys.exit(f"tracker refused to start: {reply}")
+        self._started(reply)
         threading.Thread(target=self._recv_loop, daemon=True).start()
+
+    def _started(self, reply):
+        self.state = reply["state"]
+        self.can_register = reply.get("can_register")
+        print(f"tracking {reply['object_name']} (diameter {reply['diameter_m'] * 1000:.0f} mm, "
+              f"seed {reply['seed']}, tracker can register: {reply.get('can_register')})")
 
     def _recv_loop(self):
         while True:
@@ -171,33 +172,73 @@ class Client:
                 msg = self.ws.recv()
             except Exception:  # noqa: BLE001 - closed
                 return
+            if not msg:
+                continue
             t = time.time()
             reply = json.loads(msg)
+            kind = reply.get("type")
             with self.lock:
-                if reply.get("type") == "pose":
-                    self.in_flight -= 1 + reply.get("dropped", 0)
-                    self.in_flight = max(self.in_flight, 0)
+                if kind == "pose":
+                    self.in_flight = max(self.in_flight - 1 - reply.get("dropped", 0), 0)
                     self.state = reply["state"]
                     self.hint = reply.get("hint")
                     self.replies.append((t, reply, self.meta.pop(reply["seq"], None)))
-                elif reply.get("type") == "error":
+                    frame = self.reseed_frames.pop(reply["seq"], None)
+                elif kind == "started":
+                    self._started(reply)
+                    continue
+                elif kind == "error":
                     self.errors += 1
                     self.in_flight = max(self.in_flight - 1, 0)
-                    print(f"server error: {reply.get('message')}")
+                    print(f"tracker error: {reply.get('message')}")
+                    continue
+                else:
+                    continue
+            if frame is not None:
+                threading.Thread(target=self._reseed, daemon=True,
+                                 args=(frame, reply.get("reseed_mask_png"))).start()
 
-    def send_frame(self, seq, stamp, K, rgb, depth, scale_m, dx):
+    def want_reseed(self):
+        """Should the next frame carry `want_reseed_mask`? (LOST, or forced)"""
+        with self.lock:
+            stale = time.time() - self.reseed_asked > max(self.args.reseed_interval, 5.0)
+            return not self.reseed_busy or stale
+
+    def _reseed(self, frame, mask_b64):
+        rgb, depth = frame
+        try:
+            if not mask_b64:
+                raise RuntimeError("tracker had no good pose to project a mask from")
+            pose, name, sec = fs.post_predict_pose(self.args.register_url, self.K, self.scale_m,
+                                           rgb, depth, base64.b64decode(mask_b64))
+            self.ws.send(json.dumps(start_message(self.args, pose, name)))
+            self.reseeds.append((True, sec, name))
+            print(f"  re-seed: registered {name} in {sec:.1f} s, tracker restarted")
+        except RuntimeError as err:
+            self.reseeds.append((False, 0.0, str(err)))
+            print(f"  re-seed failed: {err}")
+        finally:
+            with self.lock:
+                self.reseed_busy = False
+
+    def send_frame(self, seq, stamp, rgb, depth, dx, want_mask=False):
         a = self.args
         with self.lock:
             if self.in_flight >= a.max_in_flight:
                 return False
             roi = None
-            if a.roi and self.state == "TRACKING":
+            if a.roi and self.state == "TRACKING" and not want_mask:
                 roi = fs.roi_from_hint(self.hint, rgb.shape[:2], margin_px=a.margin)
             self.in_flight += 1
+            if want_mask:
+                self.reseed_busy = True
+                self.reseed_asked = time.time()
+                self.reseed_frames[seq] = (rgb, depth)
         t = time.perf_counter()
-        msg = fs.pack_frame(seq, stamp, K, rgb.shape[:2], fs.crop(rgb, roi),
-                            fs.crop(depth, roi), scale_m, roi=roi, rgb_enc=a.rgb_enc,
-                            depth_enc=a.depth_enc, jpeg_quality=a.jpeg_quality)
+        msg = fs.pack_frame(seq, stamp, self.K, rgb.shape[:2], fs.crop(rgb, roi),
+                            fs.crop(depth, roi), self.scale_m, roi=roi, rgb_enc=a.rgb_enc,
+                            depth_enc=a.depth_enc, jpeg_quality=a.jpeg_quality,
+                            want_reseed_mask=want_mask)
         enc_ms = (time.perf_counter() - t) * 1e3
         with self.lock:
             self.meta[seq] = (stamp, len(msg), enc_ms, roi, dx)
@@ -214,7 +255,10 @@ def summarize(c, sent, skipped, seconds, u_ref):
     rtt = np.array([(t - r["t_sent"]) * 1e3 for t, r, m in rows])
     kb = np.array([m[1] / 1024 for t, r, m in rows])
     enc = np.array([m[2] for t, r, m in rows])
-    tracked = [r for t, r, m in rows if r["state"] == "TRACKING"]
+    states = {}
+    for t, r, m in rows:
+        states[r["state"]] = states.get(r["state"], 0) + 1
+    tracked = states.get("TRACKING", 0)
     fits = [r["fit"] for t, r, m in rows if r.get("fit") is not None]
     dropped = sum(r.get("dropped", 0) for t, r, m in rows)
     stages = {}
@@ -224,8 +268,9 @@ def summarize(c, sent, skipped, seconds, u_ref):
 
     print(f"\n── summary ({seconds:.1f} s) " + "─" * 50)
     print(f"  frames: {sent} sent, {skipped} skipped by the client (in flight full), "
-          f"{dropped} dropped by the server (latest wins), {len(rows)} answered")
-    print(f"  pose rate      {len(tracked) / seconds:6.1f} Hz tracked "
+          f"{dropped} dropped by the tracker (latest wins), {len(rows)} answered")
+    print(f"  states         " + ", ".join(f"{k} {v}" for k, v in states.items()))
+    print(f"  pose rate      {tracked / seconds:6.1f} Hz tracked "
           f"({len(rows) / seconds:.1f} Hz answered)")
     print(f"  stamp -> pose  mean {e2e.mean():6.1f}  p50 {np.percentile(e2e, 50):6.1f}  "
           f"p95 {np.percentile(e2e, 95):6.1f} ms   (target <= 100, goal <= 50)")
@@ -233,8 +278,12 @@ def summarize(c, sent, skipped, seconds, u_ref):
     print(f"  payload        mean {kb.mean():6.1f} KB/frame, client encode {enc.mean():.1f} ms")
     if fits:
         print(f"  fit            mean {np.mean(fits):.2f}  min {np.min(fits):.2f}")
-    print("  server stages (mean ms): " + "  ".join(
+    print("  tracker stages (mean ms): " + "  ".join(
         f"{k.replace('_ms', '')}={np.mean(v):.1f}" for k, v in stages.items()))
+    if c.reseeds:
+        ok = [s for s in c.reseeds if s[0]]
+        print(f"  re-seeds       {len(ok)} ok / {len(c.reseeds)} tried"
+              + (f", register {np.mean([s[1] for s in ok]):.1f} s each" if ok else ""))
     if u_ref is not None:
         # The wobble moves the image by dx; a correct track moves its projection by dx.
         err = [abs(r["hint"]["u"] - (u_ref + m[4])) for t, r, m in rows
@@ -247,15 +296,29 @@ def summarize(c, sent, skipped, seconds, u_ref):
 def main():
     args = parse_args()
     K, scale_m, rgb0, depth0 = load_frame(args.frame_dir)
+
     if args.seed == "register":
-        register_over_http(args)
-    c = Client(args)
-    c.start(seed_message(args))
+        with open(args.mask, "rb") as fh:
+            mask_png = fh.read()
+        try:
+            pose, name, sec = fs.post_predict_pose(args.register_url, K, scale_m, rgb0, depth0, mask_png)
+        except RuntimeError as err:
+            sys.exit(str(err))
+        print(f"registered {name} via {args.register_url} in {sec:.1f} s")
+        first = start_message(args, pose, name)
+    elif args.seed == "pose":
+        first = start_message(args, *detection_pose(args.detection))
+    else:
+        first = start_message(args)
+
+    c = Client(args, K, scale_m)
+    c.start(first)
 
     period = 1.0 / args.rate
     still_s = 1.0 if args.wobble else 0.0   # settle before moving, to get u_ref
     sent = skipped = 0
     u_ref = None
+    forced = args.force_reseed_at is None
     t0 = time.time()
     next_print = t0 + 2.0
     seq = 0
@@ -267,16 +330,26 @@ def main():
         if tick > now:
             time.sleep(tick - now)
         stamp = time.time()  # "image stamp": when the camera produced the frame
-        tm = stamp - t0 - still_s
+        el = stamp - t0
+        tm = el - still_s
         dx = args.wobble * np.sin(2 * np.pi * args.wobble_hz * tm) if tm > 0 else 0.0
         if args.wobble and u_ref is None and tm > 0:
             with c.lock:
                 if c.hint and c.state == "TRACKING":
                     u_ref = c.hint["u"]
-        rgb = shifted(rgb0, dx, cv2.INTER_LINEAR)
-        depth = shifted(depth0, dx, cv2.INTER_NEAREST)
-        if c.send_frame(seq, stamp, K, rgb, depth, scale_m, dx):
+        if args.blackout and args.blackout[0] <= el < sum(args.blackout):
+            rgb, depth = np.zeros_like(rgb0), np.zeros_like(depth0)
+        else:
+            rgb = shifted(rgb0, dx, cv2.INTER_LINEAR)
+            depth = shifted(depth0, dx, cv2.INTER_NEAREST)
+
+        force_now = not forced and el >= args.force_reseed_at
+        want = force_now or (c.state == "LOST" and not args.no_reseed and
+                             time.time() - c.reseed_asked >= args.reseed_interval and
+                             c.want_reseed())
+        if c.send_frame(seq, stamp, rgb, depth, dx, want_mask=want):
             sent += 1
+            forced = forced or force_now
         else:
             skipped += 1
         seq += 1
@@ -289,14 +362,14 @@ def main():
                 lat = np.mean([(t - m[0]) * 1e3 for t, r, m in recent])
                 fit = recent[-1][1].get("fit")
                 roi = recent[-1][2][3]
-                print(f"  {state:<8} {len(recent) / 2.0:5.1f} Hz  stamp->pose {lat:5.1f} ms  "
-                      f"fit {fit if fit is None else round(fit, 2)}  "
+                print(f"  {el:5.1f}s {state:<8} {len(recent) / 2.0:5.1f} Hz  "
+                      f"stamp->pose {lat:5.1f} ms  fit {fit if fit is None else round(fit, 2)}  "
                       f"{'roi ' + str(roi[2]) + 'x' + str(roi[3]) if roi else 'full frame'}")
 
     deadline = time.time() + 5.0
     while time.time() < deadline:
         with c.lock:
-            if c.in_flight == 0:
+            if c.in_flight == 0 and not c.reseed_busy:
                 break
         time.sleep(0.01)
     seconds = time.time() - t0

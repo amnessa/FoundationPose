@@ -67,29 +67,27 @@ year          = {2023},
 1) [Optional] Download our preprocessed reference views [here](https://drive.google.com/drive/folders/1PXXCOJqHXwQTbwPwPbGDN9_vLVe0XpFS?usp=sharing) in order to run model-free few-shot version.
 
 # Env setup option 1: docker (recommended)
-  ```
-  cd docker/
-  docker pull wenbowen123/foundationpose && docker tag wenbowen123/foundationpose foundationpose  # Or to build from scratch: docker build --network host -t foundationpose .
-  bash docker/run_container.sh
-  ```
 
+This repo uses its own image (CUDA 12.8, PyTorch 2.8, SAM2), built from
+`docker/Dockerfile.blackwell`. The GPU architecture is a build argument, so the same
+Dockerfile serves both machines:
 
-If it's the first time you launch the container, you need to build extensions. Run this command *inside* the Docker container.
-```
-bash build_all.sh
-```
+| machine | build (from the repo root) | run |
+|---|---|---|
+| desktop, RTX 5070 Ti (Blackwell, sm_120) | `docker build -f docker/Dockerfile.blackwell -t fp-sam2:latest .` | `bash docker/run_container_blackwell.sh` |
+| laptop, RTX 4060 (Ada, sm_89) | `docker build -f docker/Dockerfile.blackwell --build-arg TORCH_CUDA_ARCH_LIST=8.9 -t fp-sam2:ada .` | `bash docker/run_container.sh` |
 
-Later you can execute into the container without re-build.
+The first time, build the native extension inside the container:
 ```
-docker exec -it foundationpose bash
+bash docker/build_extensions.sh   # builds mycpp, then runs check_env.py
 ```
 
-For more recent GPU such as 4090, refer to [this](https://github.com/NVlabs/FoundationPose/issues/27).
-In short, do the following:
-```
-docker pull shingarey/foundationpose_custom_cuda121:latest
-```
-Then modify the bash script to use this image instead of `foundationpose:latest`.
+Details (what changed from upstream, why kaolin is left out, SAM2 checkpoints):
+[docker/README_BLACKWELL.md](docker/README_BLACKWELL.md). The upstream image
+(`docker/dockerfile`, CUDA 11.3) has no kernels for either GPU.
+
+What runs where in this project (registration on the desktop, live tracking on the
+laptop): [readme_perception.md](readme_perception.md).
 
 
 # Env setup option 2: conda (local)

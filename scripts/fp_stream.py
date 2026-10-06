@@ -1,15 +1,19 @@
 """Wire protocol for live FoundationPose tracking (realtime_fp.md, S2-S5, S7).
 
-Pure numpy/OpenCV, no torch: the tracking server (`fp_tracking.py`, in the GPU
-container) and every client (`track_replay.py` on any host, the ROS tracker node in
-welding_cell_ws) import this same file, so both ends always agree on the format.
+Pure numpy/OpenCV + stdlib, no torch: the tracking server (`fp_tracking.py`, in the
+GPU container) and every client (`track_replay.py` on any host, `fp_tracker_node.py`
+in welding_cell_ws as `admittance_control/fp_stream.py`) import this same file, so
+both ends always agree on the format. Keep the copies identical.
 
 One WebSocket connection carries everything:
 
   client -> server, text (JSON control):
       {"type": "start", "seed": "last"}                  continue from the last /predict_pose
       {"type": "start", "seed": "pose", "pose": [16],    T_cam_obj in metres, CAD frame
-       "object": "test_objv2_ear"}                       (optional: switch CAD first)
+       "object": "test_objv2_ear",                       (optional: switch CAD first)
+       "T_base_cam": [16]}                               (optional: TF of the frame the
+                                                          pose was measured in, so robot
+                                                          motion since then is cancelled)
           optional in either: "refine_iter", "fit_tol_m", "fit_lost", "fit_recover",
           "lost_frames", "ego_motion", "auto_reseed", "reseed_interval_s"
       {"type": "stop"}
@@ -23,18 +27,23 @@ One WebSocket connection carries everything:
         "rgb":   {"enc": "jpeg" | "raw", "len": n},       raw = h*w*3 uint8, RGB order
         "depth": {"enc": "png"  | "raw", "len": n,        raw = h*w uint16 little endian
                   "scale": <raw units -> metres>},          e.g. 0.001 for 16UC1 in mm
-        "T_base_cam": [16] or null                        TF at the image stamp (S7)
-      }
+        "T_base_cam": [16] or null,                       TF at the image stamp (S7)
+        "want_reseed_mask": true                          optional: reply with a mask for
+      }                                                   re-registering this frame
 
   server -> client, text (JSON):
-      {"type": "started", "object_name", "diameter_m", "hint", "state"}
+      {"type": "started", "object_name", "diameter_m", "state", "seed",
+       "can_register": false on the tracking-only server: re-seed via /predict_pose}
       {"type": "stopped"} | {"type": "error", "message"}
       {"type": "pose", "seq", "stamp", "t_sent", "state": "TRACKING" | "LOST" | "IDLE",
        "pose": 4x4 T_cam_obj (metres, CAD frame -- same convention as /predict_pose) or null,
        "fit", "coverage", "object_name",
        "hint": {"u", "v", "r"}  where to crop the NEXT frame, full-frame pixels,
        "dropped": frames overwritten in the latest-wins slot since the last reply,
-       "reseeded": bool, "timings": {stage: ms}}
+       "reseeded": bool, "timings": {stage: ms},
+       "reseed_mask_png": base64 PNG, full frame, 0/255   only if asked for; the CAD's
+                          silhouette at the last good pose, dilated. Send it with the
+                          same frame to /predict_pose as `mask` to re-register.}
 
 Images are always row-major and match the ROI (or the full frame). Poses are always
 in the camera frame of the frame they answer; cropping only shifts the principal
@@ -45,6 +54,9 @@ import json
 import struct
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 
 import cv2
 import numpy as np
@@ -106,7 +118,8 @@ def decode_depth(data, enc, hw):
 
 
 def pack_frame(seq, stamp, K, full_hw, rgb, depth, depth_scale, roi=None,
-               T_base_cam=None, rgb_enc="jpeg", depth_enc="png", jpeg_quality=90):
+               T_base_cam=None, rgb_enc="jpeg", depth_enc="png", jpeg_quality=90,
+               want_reseed_mask=False):
     """One camera frame -> one binary WebSocket message.
 
     `rgb`/`depth` are already cropped to `roi` ([x0, y0, w, h]) when one is given;
@@ -126,6 +139,8 @@ def pack_frame(seq, stamp, K, full_hw, rgb, depth, depth_scale, roi=None,
         "T_base_cam": None if T_base_cam is None
         else np.asarray(T_base_cam, dtype=float).reshape(-1).tolist(),
     }
+    if want_reseed_mask:
+        header["want_reseed_mask"] = True
     hdr = json.dumps(header, separators=(",", ":")).encode()
     return b"".join([_HDR.pack(MAGIC, len(hdr)), hdr, rgb_b, depth_b])
 
@@ -296,3 +311,41 @@ class LatestSlot:
     @property
     def closed(self):
         return self._closed
+
+
+# ── registration server (/predict_pose) ───────────────────────────────────
+
+def post_predict_pose(url, K, depth_scale_m, rgb, depth, mask_png, timeout=120.0):
+    """One frame + object mask -> fp_server.py /predict_pose -> (T_cam_obj, name, s).
+
+    The same payload the bridge node sends: rgb.png, 16-bit depth.png, camera.json
+    ({"cam_K", "depth_scale": raw units -> mm}), plus `mask` so the server needs no
+    operator. `rgb` is RGB uint8, `depth` uint16 raw units, `mask_png` PNG bytes.
+    The pose is in the camera frame of this frame, CAD frame, metres. Raises
+    RuntimeError with the server's message on any failure.
+    """
+    camera = json.dumps({"cam_K": np.asarray(K, dtype=float).reshape(-1).tolist(),
+                         "depth_scale": float(depth_scale_m) * 1000.0}).encode()
+    parts = [("rgb", "rgb.png", cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))[1]),
+             ("depth", "depth.png", cv2.imencode(".png", np.asarray(depth, np.uint16))[1]),
+             ("camera", "camera.json", camera), ("mask", "mask.png", mask_png)]
+    boundary = uuid.uuid4().hex
+    body = b"".join(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{f}\"; "
+        f"filename=\"{n}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode()
+        + bytes(data) + b"\r\n" for f, n, data in parts) + f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    started = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            reply = json.loads(resp.read())
+    except urllib.error.HTTPError as err:
+        msg = err.read()[:300].decode(errors="replace")
+        raise RuntimeError(f"/predict_pose {err.code}: {msg}") from None
+    except (urllib.error.URLError, OSError) as err:
+        raise RuntimeError(f"/predict_pose unreachable at {url}: {err}") from None
+    if reply.get("status") != "success" or reply.get("units") != "m":
+        raise RuntimeError(f"/predict_pose: {reply.get('message', reply.get('status'))}")
+    return (np.asarray(reply["pose"], dtype=np.float64), reply.get("object_name"),
+            time.time() - started)

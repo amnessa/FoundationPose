@@ -51,7 +51,9 @@ fired, ROS details) comes last. The algorithm comes first.
              ▼
    publishes /perception/detections + /perception/object_name
              ▼
-   laptop ICP node: loads the same .ply, snaps it to T, tracks it
+   tracking on the laptop, from T:
+     • ICP node: loads the same .ply, snaps it to T, tracks it on the point cloud
+     • FoundationPose track_one on the laptop GPU (new, see Live tracking)
 ```
 
 Preparation (offline, once per new part) is a separate job:
@@ -345,8 +347,11 @@ Notes:
   not a probability. PPF's `classification.score` is 0–1.
 - The networks are object-agnostic and loaded once at startup. Switching CAD is a
   `reset_object()` call that takes milliseconds.
-- FoundationPose also has a **tracking mode** (`track_one`), but the server does
-  not use it. Tracking is done by ICP on the laptop.
+- FoundationPose also has a **tracking mode** (`track_one`). `/predict_pose` does not
+  use it; it runs on the laptop for live tracking, starting from this pose. See
+  [Live tracking](#live-tracking-foundationpose-on-the-laptop).
+- `REGISTER_CROP=1` registers on the square around the mask instead of the whole
+  frame (off by default). Only for GPUs with 8 GB: see the notes in Live tracking.
 
 **Example from the last run** (`Data/Output/foundationpose_results/detection_pem.json`):
 object `test_objv2_ear`, translation ≈ (164, 45, 499) mm, i.e. about 50 cm from the
@@ -386,6 +391,156 @@ the HTTP reply is in **metres**.
 
 The name reaches downstream three ways: `Detection3D.id` / `class_id`, the latched
 `/perception/object_name` topic, and `object_name.txt` in the results directory.
+
+---
+
+## Live tracking: FoundationPose on the laptop
+
+*Added 6 October 2026. Design and reasoning: [realtime_fp.md](realtime_fp.md).*
+
+Registration (steps 0–4) answers "where is the part" **once**, in 1–4 s. To follow
+a part while it is being placed, FoundationPose's second mode, `track_one`, is run
+on **every camera frame**: it starts from the previous pose and only corrects it with
+2 passes of the refiner network (no hypotheses, no scorer), so it takes tens of
+milliseconds instead of seconds.
+
+### Who does what
+
+Registration stays on the desktop. Tracking runs **on the laptop's own GPU**
+(RTX 4060), next to the camera, so camera frames never cross the network. Only one
+frame per registration goes to the desktop.
+
+```
+ LAPTOP (camera, ROS 2 Jazzy, RTX 4060)                       DESKTOP (RTX 5070 Ti)
+
+ camera ─▶ foundationpose_bridge_node ── HTTP, 1 frame ─────▶ fp_server.py :5000
+                                       ◀─ pose + object name ─  /predict_pose (steps 0–4)
+              │ /perception/detections (latched) = the seed
+              ▼
+ camera ─▶ fp_tracker_node  (ROS node, laptop host)
+  30 Hz       │  ▲
+              │  │  ws://127.0.0.1:5001, same machine, raw bytes
+              ▼  │
+          fp_track_server.py  (laptop container fp-sam2:ada)
+          refiner network only, track_one per frame
+              │
+              ▼
+   /perception/fp/pose (PoseStamped)  +  TF camera_color_optical_frame → fp_object
+   (same message types as the ICP node)
+```
+
+| piece | where | file |
+|---|---|---|
+| registration server | desktop container | `scripts/fp_server.py` (unchanged role) |
+| tracking-only server | laptop container | `scripts/fp_track_server.py` |
+| tracking state machine + WebSocket server | both servers import it | `scripts/fp_tracking.py` |
+| wire protocol (no torch) | everywhere | `scripts/fp_stream.py` |
+| ROS client | laptop host (welding_cell_ws) | `scripts/fp_tracker_node.py` |
+| test client without ROS | any host | `scripts/track_replay.py` |
+| GPU benchmark | container | `scripts/track_bench.py` |
+
+Why a WebSocket between the ROS node and the tracker, on the same laptop: the
+container is Ubuntu 22.04 / Python 3.10 without ROS, the workspace is ROS 2 Jazzy /
+Python 3.12, and Humble↔Jazzy DDS is not supported. On localhost the socket only
+costs a few milliseconds of copying.
+
+### One frame, step by step
+
+**Seed.** The bridge publishes the registered pose on `/perception/detections`
+(latched). The node sends it to the tracker as `start`: the pose `T` (4×4, camera
+frame, metres), the object name (selects the `.ply`), and `T_base_cam` from TF at the
+detection's stamp.
+
+**Each frame** (the node takes the newest RGB-D pair; at most 2 frames are in flight,
+older ones are skipped, never queued):
+
+| | in | done | out |
+|---|---|---|---|
+| node | `/camera/color/image_raw` (rgb8), `/camera/depth/image_rect_raw` (16UC1, mm), `camera_info`, TF | pair by stamp, look up `T_base_cam` at the image stamp, pack header + raw bytes | one binary message, ~4.6 MB at 1280×720 |
+| tracker | header (seq, stamp, K, depth scale, `T_base_cam`), RGB, depth | depth → metres; **ego-motion prediction** (below); `track_one`, 2 refiner passes; **fit** check (below) | JSON: pose 4×4 or null, state, fit |
+| node | reply | publish if TRACKING | `PoseStamped` + TF, stamped with the **image** stamp |
+
+**Ego-motion prediction.** The camera is on the robot's wrist. When the arm moves,
+a still part jumps in the image. Before tracking, the tracker moves the previous pose
+by the camera's own motion:
+
+```
+pose_predicted = inv(T_base_cam_now) · T_base_cam_previous · pose_previous
+```
+
+so `track_one` only has to follow the part's own motion. Without TF this step is
+skipped and arm motion looks like part motion.
+
+**Fit: is the pose still right?** `track_one` returns a pose but no score. So after
+each frame the CAD is rendered at the new pose and compared with the measured depth:
+
+```
+fit = (rendered CAD pixels whose measured depth is within 10 mm) / (rendered CAD pixels)
+```
+
+**States:**
+
+```
+IDLE ──start──▶ TRACKING ──fit < 0.5 for 3 frames──▶ LOST ──fit ≥ 0.6──▶ TRACKING
+```
+
+While LOST:
+1. no pose is published (the TF stops; nothing wrong is shown),
+2. every frame the tracker retries cheaply from the last good pose (a hand that
+   briefly covered the part),
+3. every 3 s the node re-registers through the desktop **without a click**: it asks
+   the tracker for the CAD's silhouette at the last good pose (dilated), sends that
+   frame + mask to `/predict_pose`, and restarts tracking from the answer.
+
+### Measured (RTX 4060 laptop)
+
+`track_bench.py`, GPU only, saved 1280×720 frame, still part, 200 frames each:
+
+| refine passes | input | ms/frame mean (p95) | rate | jitter |
+|---|---|---|---|---|
+| 1 | full frame | 28.3 (40.1) | 35 Hz | 0.5 mm, 0.16° |
+| 2 | full frame | 43.2 (59.9) | 23 Hz | 0.5 mm, 0.19° |
+| 1 | ROI crop 524×478 | 23.6 (34.8) | 42 Hz | 0.7 mm, 0.22° |
+| 2 | ROI crop | 38.8 (56.1) | 26 Hz | 0.7 mm, 0.27° |
+
+The tracking-only server uses ~250 MB of GPU memory.
+
+`fp_tracker_node` end to end, with a test publisher in place of the camera (saved
+frame at 30 Hz) and both servers on the same 4060:
+
+| | result | target |
+|---|---|---|
+| `/perception/fp/pose` rate | 25–29 Hz | ≥ 15 Hz (goal 30) |
+| image stamp → pose | 70–90 ms (raw bytes); ~100 ms with JPEG/PNG | ≤ 100 ms (goal 50) |
+| image blanked for 1.5 s | LOST after 3 frames, recovered by itself (fit 0.90) | |
+| re-registration through `/predict_pose` | 3.9–4.0 s, tracking restarted | |
+
+During a registration on the same GPU tracking dropped to ~8 Hz. In the real split
+the desktop registers on its own GPU, so this does not happen.
+
+### Notes and limits
+
+- **Registration does not fit on the laptop.** A full-frame `register()` needs more
+  than 8 GB: the scorer warps all 252 hypotheses to full-frame size at once (one
+  2.6 GB allocation). `REGISTER_CROP=1` crops the frame to the region the networks
+  look at and fits (peak 4.3 GB), but it is **not verified** to give the same pose,
+  so it is off by default and only used for single-machine tests.
+- **The fit check is fooled by flat parts on flat surfaces.** A thin plate lying on
+  a table fits the depth in any in-plane position. On the test frame a wrong pose
+  scored 0.94.
+- **The test frame has no real part in it.** Its mask is a strip on the flat plate.
+  Rate, delay and the LOST logic are measured; **pose accuracy of tracking is not**.
+  Next: record a sequence with a real part moving.
+- **The seed's stamp.** The bridge stamps `/perception/detections` with the publish
+  time, not the captured frame's stamp. If the arm moves between capture and reply,
+  the seed is off by that motion (tracking pulls in small offsets; large ones end in
+  LOST and a re-seed). Fix in the bridge: `out.header.stamp = frozen.stamp`.
+- **Full frame by default.** The node can crop to the region around the part
+  (`use_roi`), which cuts the copy and the depth filtering, but with the tracker on
+  localhost there is little to gain.
+- ICP is unchanged and still does the stationary steps (`save_object`,
+  `refine_pose`). Handing tracking over to `/perception/fp/pose` in the ICP node
+  (`tracking_source: fp`) is the next step (realtime_fp.md, step 6).
 
 ---
 
@@ -476,8 +631,10 @@ Perception:
 - [ ] **Compare the PPF pose with the FoundationPose pose.** Accuracy and time on
       3–5 different scenes. The case for FoundationPose should rest on this table.
       The PPF pose is already computed; it just needs to be returned.
-- [ ] **Compare FoundationPose tracking (`track_one`) with ICP tracking**, so that
-      choosing ICP is backed by a measurement.
+- [ ] **Compare FoundationPose tracking (`track_one`) with ICP tracking.** The
+      tracking path now exists ([Live tracking](#live-tracking-foundationpose-on-the-laptop));
+      run `pose_jitter_probe.py` on `/perception/fp/pose` and
+      `/perception/icp/refined_pose` with a still and a moving part.
 - [ ] **Measure timings** separately: PPF matching per model, SAM2, FoundationPose
       `register()`.
 - [ ] **Find the camera's best working distance.** How depth error changes with
@@ -515,6 +672,23 @@ python scripts/fp_server.py                # listens on :5000
 Startup loads the FoundationPose networks, then the PPF detectors (~1–2 s per
 model), then SAM2.
 
+**Live tracking (laptop).** Build the laptop image once (Ada, sm_89), then:
+
+```bash
+docker build -f docker/Dockerfile.blackwell --build-arg TORCH_CUDA_ARCH_LIST=8.9 -t fp-sam2:ada .
+docker/run_container.sh                    # laptop container
+python scripts/fp_track_server.py          # inside it: listens on 127.0.0.1:5001
+
+# laptop host, ROS 2
+ros2 run admittance_control fp_tracker_node.py --ros-args \
+    -p register_url:=http://<desktop>:5000/predict_pose
+
+# without ROS: stream a saved frame, simulate motion / a covered part / a re-seed
+python3 scripts/track_replay.py --register-url http://<desktop>:5000/predict_pose \
+    --wobble 40 --blackout 5 1.5 --force-reseed-at 10
+python scripts/track_bench.py              # GPU-only timing (inside the container)
+```
+
 **Use `/classify` during bring-up.** It stops after step 3, spends no GPU time on a
 pose, and returns the whole score table:
 
@@ -547,7 +721,8 @@ separate those; they compete on score alone.
 | `POST /classify` | steps 0–3. For bring-up. |
 | `POST /predict_pose` | steps 0–4, the whole chain |
 | `POST /add_model` | index a new `.ply` into the live library and persist it |
-| `GET /health` | what is loaded and what is in the library |
+| `GET /health` | what is loaded, what is in the library, tracking state |
+| `ws://:5001` | live tracking endpoint of `fp_server.py` itself (`TRACK_ENABLE`). Not used in the laptop/desktop split; `fp_track_server.py` serves the same protocol on the laptop |
 
 ### Configuration (environment variables, all optional)
 
@@ -562,6 +737,33 @@ separate those; they compete on score alone.
 | `ZFAR` | `3.0` | depth beyond this many metres is discarded |
 | `SYMMETRY_INFO` | – | BOP-style symmetry info for symmetric parts |
 | `TIMING_CSV` | `Data/Output/timings.csv` | where per-stage timings are appended |
+| `REGISTER_CROP` | `0` | `1`: register on the region around the mask (8 GB GPUs; unverified) |
+| `TRACK_ENABLE` / `TRACK_PORT` | `1` / `5001` | `fp_server.py`'s own tracking endpoint |
+
+`fp_track_server.py` (laptop) reads `CAD_DIR`, `MESH_SCALE`, `MESH_PATH`, `ZFAR`,
+`TRACK_HOST` (`127.0.0.1`) and `TRACK_PORT` (`5001`).
+
+`fp_tracker_node` parameters (defaults):
+
+| parameter | default | meaning |
+|---|---|---|
+| `track_url` | `ws://127.0.0.1:5001` | the tracking-only server |
+| `register_url` | `http://127.0.0.1:5000/predict_pose` | the desktop, for re-registration |
+| `rgb_topic` / `depth_topic` / `camera_info_topic` | `/camera/color/image_raw` / `/camera/depth/image_rect_raw` / `/camera/color/camera_info` | camera input, paired by stamp |
+| `detections_topic` | `/perception/detections` | the seed (from the bridge) |
+| `pose_topic` / `status_topic` / `marker_topic` | `/perception/fp/pose` / `/perception/fp/status` / `/perception/fp/marker` | outputs |
+| `base_frame` / `child_frame` | `base_link` / `fp_object` | ego-motion TF / published TF |
+| `auto_start`, `max_seed_age_sec` | `true`, `30` | start on every new detection younger than this |
+| `max_in_flight` | `2` | frames sent but not yet answered |
+| `refine_iter` | `2` | refiner passes per frame (1 is faster, more jitter) |
+| `rgb_encoding` / `depth_encoding` | `raw` / `raw` | `jpeg` / `png` only if the tracker is on another machine |
+| `use_roi`, `roi_margin_px` | `false`, `40` | crop around the part |
+| `ego_motion` | `true` | cancel arm motion with TF |
+| `fit_tol_m`, `fit_lost`, `fit_recover`, `lost_frames` | `0.010`, `0.5`, `0.6`, `3` | LOST detection |
+| `reseed`, `reseed_interval_sec` | `true`, `3.0` | re-register through the desktop while LOST |
+| `mesh_resource`, `mesh_scale` | `package://admittance_control/models/{object}.ply`, `0.001` | RViz mesh marker |
+
+Services: `~/start` (track from the last detection), `~/stop`, `~/reseed`.
 
 Full list and PPF details: [docs/PPF.md](docs/PPF.md).
 
@@ -652,3 +854,5 @@ is the only reliable check.
   Read self-test accuracy as an upper bound.
 - Evaluation on real data currently rests on **a single frame** (`test_objv2_ear`,
   margin 0.438). That is not an evaluation.
+- Live tracking: see [Notes and limits](#notes-and-limits) (no registration on the
+  8 GB laptop, the fit check on flat parts, tracking accuracy not yet measured).
