@@ -1,0 +1,280 @@
+{
+  "version": "weldgen_registry-1.0",
+  "units": "mm",
+  "parts": {
+    "270circle": {
+      "primitive": null,
+      "reason": "fills only 9% of its envelope (features > 10%) - not a slab",
+      "source": "270circle.ply"
+    },
+    "Power Drill-ply": {
+      "primitive": null,
+      "reason": "vertices deviate 130.769 mm from a box (tol 0.05)",
+      "source": "Power Drill-ply.ply"
+    },
+    "Tblock": {
+      "primitive": null,
+      "reason": "fills only 18% of its envelope (features > 10%) - not a slab",
+      "source": "Tblock.ply"
+    },
+    "assembly_mesh": {
+      "primitive": null,
+      "reason": "vertices deviate 117.061 mm from a box (tol 0.05)",
+      "source": "assembly_mesh.ply"
+    },
+    "plate": {
+      "primitive": "slab",
+      "dims_mm": [
+        150.0,
+        100.0,
+        4.000000000000022
+      ],
+      "T_cad_prim": [
+        [
+          -1.0,
+          0.0,
+          -1.2246467991473532e-16,
+          75.0
+        ],
+        [
+          1.2246467991473532e-16,
+          0.0,
+          -1.0,
+          -1.999999999999989
+        ],
+        [
+          0.0,
+          -1.0,
+          0.0,
+          50.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "approx": "exact",
+      "max_dev_mm": 3.1308289294429414e-14,
+      "volume_rel_err": 2.7891170854369642e-15,
+      "source": "plate.ply",
+      "verified_max_dev_mm": 9.325873406851315e-15
+    },
+    "smallplate": {
+      "primitive": "slab",
+      "dims_mm": [
+        100.0,
+        50.0,
+        4.0
+      ],
+      "T_cad_prim": [
+        [
+          1.0,
+          -1.2246467991473532e-16,
+          0.0,
+          50.0
+        ],
+        [
+          -1.2246467991473532e-16,
+          -1.0,
+          0.0,
+          25.0
+        ],
+        [
+          -0.0,
+          0.0,
+          -1.0,
+          2.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "approx": "exact",
+      "max_dev_mm": 7.105427357601002e-15,
+      "volume_rel_err": 0.0,
+      "source": "smallplate.ply",
+      "verified_max_dev_mm": 7.105427357601002e-15
+    },
+    "test_objectv1": {
+      "primitive": null,
+      "reason": "fills only 12% of its envelope (features > 10%) - not a slab",
+      "source": "test_objectv1.ply"
+    },
+    "test_objv1_base": {
+      "primitive": "slab",
+      "dims_mm": [
+        180.0,
+        100.0,
+        4.000000000000022
+      ],
+      "T_cad_prim": [
+        [
+          -1.0,
+          0.0,
+          -1.2246467991473532e-16,
+          90.0
+        ],
+        [
+          1.2246467991473532e-16,
+          0.0,
+          -1.0,
+          -1.9999999999999891
+        ],
+        [
+          0.0,
+          -1.0,
+          0.0,
+          50.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "approx": "envelope",
+      "max_dev_mm": 50.0,
+      "envelope_deficit": 0.011111111111113625,
+      "source": "test_objv1_base.ply",
+      "verified_max_dev_mm": 2.7537112142410605e-14
+    },
+    "test_objv1_ear": {
+      "primitive": "slab",
+      "dims_mm": [
+        100.0,
+        54.0,
+        4.000000000000022
+      ],
+      "T_cad_prim": [
+        [
+          0.0,
+          -1.0,
+          1.2246467991473532e-16,
+          23.0
+        ],
+        [
+          0.0,
+          1.2246467991473532e-16,
+          1.0,
+          -1.9999999999999891
+        ],
+        [
+          -1.0,
+          0.0,
+          -0.0,
+          50.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "approx": "envelope",
+      "max_dev_mm": 10.0,
+      "envelope_deficit": 0.059259259259261676,
+      "source": "test_objv1_ear.ply",
+      "verified_max_dev_mm": 1.8018485975060554e-14
+    },
+    "test_objv2": {
+      "primitive": null,
+      "reason": "fills only 13% of its envelope (features > 10%) - not a slab",
+      "source": "test_objv2.ply"
+    },
+    "test_objv2_base": {
+      "primitive": "slab",
+      "dims_mm": [
+        256.0,
+        249.0,
+        8.000000000000057
+      ],
+      "T_cad_prim": [
+        [
+          0.0,
+          -1.0,
+          1.2246467991473532e-16,
+          124.5
+        ],
+        [
+          0.0,
+          1.2246467991473532e-16,
+          1.0,
+          -3.999999999999971
+        ],
+        [
+          -1.0,
+          0.0,
+          -0.0,
+          128.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "approx": "exact",
+      "max_dev_mm": 7.238654120556021e-14,
+      "volume_rel_err": 3.424302341012507e-15,
+      "source": "test_objv2_base.ply",
+      "verified_max_dev_mm": 1.5987211554602254e-14
+    },
+    "test_objv2_ear": {
+      "primitive": "slab",
+      "dims_mm": [
+        250.0,
+        99.0,
+        8.000000000000021
+      ],
+      "T_cad_prim": [
+        [
+          -1.0,
+          0.0,
+          -1.2246467991473532e-16,
+          125.0
+        ],
+        [
+          1.2246467991473532e-16,
+          0.0,
+          -1.0,
+          -3.9999999999999893
+        ],
+        [
+          0.0,
+          -1.0,
+          0.0,
+          49.5
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "approx": "exact",
+      "max_dev_mm": 3.6415315207705135e-14,
+      "volume_rel_err": 1.322901384396983e-15,
+      "source": "test_objv2_ear.ply",
+      "verified_max_dev_mm": 1.5765166949677223e-14
+    },
+    "test_objv3": {
+      "primitive": null,
+      "reason": "vertices deviate 124.000 mm from a box (tol 0.05)",
+      "source": "test_objv3.ply"
+    },
+    "vplate": {
+      "primitive": null,
+      "reason": "fills only 8% of its envelope (features > 10%) - not a slab",
+      "source": "vplate.ply"
+    }
+  }
+}
