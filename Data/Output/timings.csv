@@ -588,3 +588,21 @@ timestamp,request_id,endpoint,status,object_name,stage,cad,seconds,detail
 2026-10-06T17:18:29,21,/predict_pose,success,test_objv2_ear,FoundationPose register,,1.2541,5 refine iters
 2026-10-06T17:18:29,21,/predict_pose,success,test_objv2_ear,overlay + artifacts,,0.1134,
 2026-10-06T17:18:29,21,/predict_pose,success,test_objv2_ear,TOTAL,,3.8391,
+2026-10-09T17:30:12,1,startup,success,,load FoundationPose (scorer + refiner),,0.5694,
+2026-10-09T17:30:12,1,startup,success,,load PPF library,,22.9263,
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,270circle,1.1020,574 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,Tblock,2.4392,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,plate,1.7869,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,powerdrill,0.2450,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,smallplate,2.3784,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objectv1,1.0369,546 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objv1_base,1.3673,558 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objv1_ear,0.6001,350 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objv2,1.5257,576 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objv2_base,2.4366,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objv2_ear,1.4033,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,test_objv3,1.1946,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,vplate,3.0703,560 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,ppf: train detector,assembly_mesh,2.3214,600 model pts (included above)
+2026-10-09T17:30:12,1,startup,success,,load SAM2,,0.7815,
+2026-10-09T17:30:12,1,startup,success,,TOTAL,,24.2773,

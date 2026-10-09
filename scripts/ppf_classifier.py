@@ -106,11 +106,14 @@ class QueryParams:
     # supposed to have, which is comparability across the library. 8mm suits a
     # RealSense at about 0.8m; tighten it for a better sensor or a closer standoff.
     tau_m: float = 0.008
-    icp_polish: bool = True         # refine each hypothesis before scoring. Runs
-                                    # identically on every candidate so it cannot bias
-                                    # the ranking; it just stops PPF's coarse
-                                    # quantization from showing up as a coverage
-                                    # penalty that differs by model.
+    icp_polish: bool = True         # also score an ICP-polished copy of each
+                                    # hypothesis and keep whichever scores higher. It
+                                    # stops PPF's coarse quantization from showing up
+                                    # as a coverage penalty that differs by model. The
+                                    # unpolished pose is always scored too, because ICP
+                                    # can diverge: on curved parts (cylinders, elbows)
+                                    # it slid correct hypotheses to a score of 0, and
+                                    # the self-test fell from 37/39 to 22/39.
     icp_iterations: int = 50
 
     # Extent pre-filter. Nearly free, and on a library of differently-sized parts it
@@ -580,14 +583,13 @@ class PPFLibrary:
         t1 = time.perf_counter()
         for p in poses[:q.n_hypotheses]:
             T = np.asarray(p.pose, dtype=np.float64)
-            if icp is not None:
-                T = _icp_refine(icp, m.cloud, T, scene)
-            score, cov, exp, n_vis = _verification_score(m.cloud, T, scene_pts,
-                                                         scene_tree, K, tau)
-            if score > out['score']:
-                out.update(score=float(score), coverage=float(cov),
-                           explained=float(exp), visible_points=int(n_vis),
-                           votes=float(p.numVotes))
+            for T in ([T, _icp_refine(icp, m.cloud, T, scene)] if icp is not None else [T]):
+                score, cov, exp, n_vis = _verification_score(m.cloud, T, scene_pts,
+                                                             scene_tree, K, tau)
+                if score > out['score']:
+                    out.update(score=float(score), coverage=float(cov),
+                               explained=float(exp), visible_points=int(n_vis),
+                               votes=float(p.numVotes))
         out['verify_sec'] = round(time.perf_counter() - t1, 4)
         out['elapsed_sec'] = round(time.perf_counter() - t0, 4)
         return out
@@ -605,7 +607,9 @@ def _icp_refine(icp, cloud: np.ndarray, T: np.ndarray, scene: np.ndarray) -> np.
 
     Every candidate gets exactly the same treatment, so this cannot bias the
     ranking. What it removes is PPF's coarse angular quantization, which would
-    otherwise land in the score as a coverage penalty that differs by model.
+    otherwise land in the score as a coverage penalty that differs by model. The
+    caller scores the unpolished pose as well, because this can also make a pose
+    worse (see `QueryParams.icp_polish`).
     """
     posed = np.hstack([cloud[:, :3] @ T[:3, :3].T + T[:3, 3],
                        cloud[:, 3:] @ T[:3, :3].T]).astype(np.float32)
@@ -642,14 +646,16 @@ def _visible_model_points(pts_cam: np.ndarray, nrm_cam: np.ndarray,
     u = np.floor((K[0, 0] * pts_cam[:, 0] / np.maximum(z, 1e-6) + K[0, 2]) / cell_px)
     v = np.floor((K[1, 1] * pts_cam[:, 1] / np.maximum(z, 1e-6) + K[1, 2]) / cell_px)
     idx = np.where(front)[0]
-    cu = (u - u[idx].min()).astype(np.int64)
-    cv_ = (v - v[idx].min()).astype(np.int64)
-    cell = cv_ * (int(cu[idx].max()) + 1) + cu
+    # Number only the occupied cells. Indexing a dense grid over the bounding range
+    # breaks on a bad hypothesis: a point at z ~ 1e-6 projects to u ~ 1e9, and the
+    # grid it implies is hundreds of GiB.
+    _, cell = np.unique(np.stack([u[idx], v[idx]], axis=1), axis=0, return_inverse=True)
+    cell = cell.ravel()
 
-    nearest = np.full(int(cell[idx].max()) + 1, np.inf)
-    np.minimum.at(nearest, cell[idx], z[idx])
+    nearest = np.full(int(cell.max()) + 1, np.inf)
+    np.minimum.at(nearest, cell, z[idx])
     visible = np.zeros(len(pts_cam), dtype=bool)
-    visible[idx] = z[idx] <= nearest[cell[idx]] + tau
+    visible[idx] = z[idx] <= nearest[cell] + tau
     return visible
 
 

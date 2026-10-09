@@ -837,8 +837,9 @@ is the only reliable check.
 | symptom | likely cause |
 |---|---|
 | size filter rejected every model | bad depth, or the mask leaked onto the background. The filter is then ignored, so the table is still readable. |
-| the right part scores near zero against itself (self-test) | that model needs a finer sampling step. `ppf_selftest.py` prints the `--add --sampling-step` command. Example: `270circle` (thin ring). |
-| two parts keep swapping, small margin | they really are similar from one view (`plate` ↔ `test_objv1_base`). Raise `PPF_MIN_MARGIN`. |
+| the right part scores near zero against itself (self-test) | that model may need a finer sampling step. `ppf_selftest.py` prints the `--add --sampling-step` command; re-run the self-test to confirm it helped, because it often does not. On the curved parts (`C1`, `R2`, `RR1`, `E2`, `S3`, `SP3`) the real cause was ICP polish sliding correct poses away, now fixed by also scoring the unpolished pose. |
+| `assembly_mesh` loses to `test_objv2_base` / `test_objv2_ear` | an assembly contains its parts' surfaces, so a view showing mostly one part is explained by that part alone. Expected from one view. |
+| two parts keep swapping, small margin | they really are similar from one view (`plate` ↔ `vplate`). Raise `PPF_MIN_MARGIN`. |
 | one model never wins anywhere | check its printed extents; almost always an export-unit slip |
 | box in `vis_pose.png` is the right shape in the wrong place | classification right, pose wrong |
 | box in `vis_pose.png` is the wrong shape | classification wrong; check `classification.scores` |
